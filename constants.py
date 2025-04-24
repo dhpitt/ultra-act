@@ -1,34 +1,49 @@
 import pathlib
 
 ### Task parameters
-DATA_DIR = '/local_data'
+DATA_DIR = './local_data'
+WANDB_ENTITY = 'dhpitt'
+WANDB_PROJECT = 'ultra-interview'
+
+
 SIM_TASK_CONFIGS = {
     'sim_transfer_cube_scripted':{
         'dataset_dir': DATA_DIR + '/sim_transfer_cube_scripted',
         'num_episodes': 50,
         'episode_len': 400,
-        'camera_names': ['top']
+        'camera_names': ['top'],
+        'wandb_entity': WANDB_ENTITY,
+        'wandb_project': WANDB_PROJECT
     },
 
     'sim_transfer_cube_human':{
         'dataset_dir': DATA_DIR + '/sim_transfer_cube_human',
         'num_episodes': 50,
         'episode_len': 400,
-        'camera_names': ['top']
+        'camera_names': ['top'],
+        'wandb_entity': WANDB_ENTITY,
+        'wandb_project': WANDB_PROJECT
     },
 
     'sim_insertion_scripted': {
         'dataset_dir': DATA_DIR + '/sim_insertion_scripted',
         'num_episodes': 50,
         'episode_len': 400,
-        'camera_names': ['top']
+        'camera_names': ['top'],
+        'wandb_entity': WANDB_ENTITY,
+        'wandb_project': WANDB_PROJECT,
+        'wandb_name': 'setup',
+        'wandb_log': True,
+
     },
 
     'sim_insertion_human': {
         'dataset_dir': DATA_DIR + '/sim_insertion_human',
         'num_episodes': 50,
         'episode_len': 500,
-        'camera_names': ['top']
+        'camera_names': ['top'],
+        'wandb_entity': WANDB_ENTITY,
+        'wandb_project': WANDB_PROJECT,
     },
 
     'sim_pickup_scripted': {
@@ -36,7 +51,9 @@ SIM_TASK_CONFIGS = {
         'num_episodes': 10,
         'episode_len': 250,
         'camera_names': ['top'],
-        'state_dim': 7 
+        'state_dim': 7 ,
+        'wandb_entity': WANDB_ENTITY,
+        'wandb_project': WANDB_PROJECT
     }
 }
 

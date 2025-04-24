@@ -8,6 +8,9 @@ from copy import deepcopy
 from tqdm import tqdm
 from einops import rearrange
 
+import wandb
+from datetime import datetime
+
 from constants import DT
 from constants import PUPPET_GRIPPER_JOINT_OPEN 
 from utils import load_data # data functions
@@ -47,6 +50,10 @@ def main(args):
     num_episodes = task_config['num_episodes']
     episode_len = task_config['episode_len']
     camera_names = task_config['camera_names']
+
+    # task config wandb log
+    wandb_log = task_config['wandb_log']
+
 
     # fixed parameters
     state_dim = task_config.get('state_dim', 14)
@@ -88,14 +95,38 @@ def main(args):
         'seed': args['seed'],
         'temporal_agg': args['temporal_agg'],
         'camera_names': camera_names,
-        'real_robot': not is_sim
+        'real_robot': not is_sim,
+        'wandb_log': wandb_log
     }
+
+    # log to wandb if set
+    print(f"{wandb_log=}")
+    
+    if wandb_log:
+        # Use basename from args and add info from current run
+        wandb_name = task_config.get('wandb_name', '')
+        name_keywords = ['task_name', 'real_robot', 'policy_class']
+
+        for kw in name_keywords:
+            wandb_name += f'_{kw}=' + str(config[kw]) + '_'
+
+        wandb_name += str(datetime.now())
+
+        wandb.init(entity=task_config['wandb_entity'],
+                project=task_config['wandb_project'],
+                name=wandb_name)
+
+        wandb.log(config, step=None)
 
     if is_eval:
         ckpt_names = [f'policy_best.ckpt']
         results = []
         for ckpt_name in ckpt_names:
             success_rate, avg_return = eval_bc(config, ckpt_name, save_episode=True)
+            if wandb_log:
+                wandb.log({'eval_ckpt_name': ckpt_name, 
+                       'eval_success_rate': success_rate,
+                       'eval_avg_return': avg_return}, step=None)
             results.append([ckpt_name, success_rate, avg_return])
 
         for ckpt_name, success_rate, avg_return in results:
@@ -330,6 +361,7 @@ def train_bc(train_dataloader, val_dataloader, config):
     seed = config['seed']
     policy_class = config['policy_class']
     policy_config = config['policy_config']
+    wandb_log = config.get('wandb_log')
 
     set_seed(seed)
 
@@ -341,8 +373,12 @@ def train_bc(train_dataloader, val_dataloader, config):
     validation_history = []
     min_val_loss = np.inf
     best_ckpt_info = None
-    for epoch in tqdm(range(num_epochs)):
-        print(f'\nEpoch {epoch}')
+
+    # define custom progress bar w/stats logged
+    summary_string = "EMPTY"
+    progress_bar = tqdm(range(num_epochs), postfix=summary_string)
+    for epoch in progress_bar:
+        
         # validation
         with torch.inference_mode():
             policy.eval()
@@ -357,11 +393,15 @@ def train_bc(train_dataloader, val_dataloader, config):
             if epoch_val_loss < min_val_loss:
                 min_val_loss = epoch_val_loss
                 best_ckpt_info = (epoch, min_val_loss, deepcopy(policy.state_dict()))
-        print(f'Val loss:   {epoch_val_loss:.5f}')
-        summary_string = ''
+
+        # Log val metrics to wandb
+        if wandb_log:
+            wandb.log({f"val_{k}": v for k, v in epoch_summary.items()}, commit=False, step=epoch)
+        
+        # create val summary string to append to progress bar
+        val_summary_string = ''
         for k, v in epoch_summary.items():
-            summary_string += f'{k}: {v.item():.3f} '
-        print(summary_string)
+            val_summary_string += f'{k}: {v.item():.3f} '
 
         # training
         policy.train()
@@ -376,11 +416,16 @@ def train_bc(train_dataloader, val_dataloader, config):
             train_history.append(detach_dict(forward_dict))
         epoch_summary = compute_dict_mean(train_history[(batch_idx+1)*epoch:(batch_idx+1)*(epoch+1)])
         epoch_train_loss = epoch_summary['loss']
-        print(f'Train loss: {epoch_train_loss:.5f}')
-        summary_string = ''
+
+        # Log training epoch metrics to wandb
+        if wandb_log:
+            wandb.log({f"train_{k}": v for k, v in epoch_summary.items()}, commit=True, step=epoch)
+
+        train_summary_string = ''
         for k, v in epoch_summary.items():
-            summary_string += f'{k}: {v.item():.3f} '
-        print(summary_string)
+            train_summary_string += f'{k}: {v.item():.3f} '
+        progress_bar.set_postfix_str(f"Train: {train_summary_string} | Val: {val_summary_string}")
+        #print(summary_string)
 
         if epoch % 100 == 0:
             ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{epoch}_seed_{seed}.ckpt')
@@ -429,6 +474,7 @@ if __name__ == '__main__':
     parser.add_argument('--seed', action='store', type=int, help='seed', required=True)
     parser.add_argument('--num_epochs', action='store', type=int, help='num_epochs', required=True)
     parser.add_argument('--lr', action='store', type=float, help='lr', required=True)
+    parser.add_argument('--wandb_log', action='store', type=bool, help='log to wandb?', required=False)
 
     # for ACT
     parser.add_argument('--kl_weight', action='store', type=int, help='KL Weight', required=False)
