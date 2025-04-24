@@ -92,7 +92,7 @@ def main(args):
     camera_names = task_config['camera_names']
 
     # task config wandb log
-    wandb_log = task_config['wandb_log']
+    wandb_log = args['wandb_log']
 
 
     # fixed parameters
@@ -142,7 +142,7 @@ def main(args):
         
     if wandb_log and is_logger:
         # Use basename from args and add info from current run
-        wandb_name = task_config.get('wandb_name', '')
+        wandb_name = args.get('wandb_name', '')
 
         wandb_name += f'_policy=' + str(policy_class)
         wandb_name += f'_task=' + str(task_name)
@@ -150,8 +150,8 @@ def main(args):
         now = datetime.now()
         wandb_name += f"_{now.month}-{now.day}-{now.hour}-{now.minute}-{now.second}"
 
-        wandb.init(entity=task_config['wandb_entity'],
-                project=task_config['wandb_project'],
+        wandb.init(entity=args['wandb_entity'],
+                project=args['wandb_project'],
                 name=wandb_name)
 
         # update checkpoint directory with wandb run name
@@ -544,6 +544,7 @@ def plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed):
         plt.legend()
         plt.title(key)
         plt.savefig(plot_path)
+        plt.close()
     print(f'Saved plots to {ckpt_dir}')
 
 
@@ -561,6 +562,11 @@ if __name__ == '__main__':
     parser.add_argument('--lr', action='store', type=float, help='lr', required=True)
 
     # david's args
+    parser.add_argument('--wandb_log', action='store', type=str, help='log to wandb', required=False, default=False)
+    parser.add_argument('--wandb_entity', action='store', type=str, help='wandb username', required=False, default='dhpitt')
+    parser.add_argument('--wandb_project', action='store', type=str, help='wandb username', required=False, default='')
+    parser.add_argument('--wandb_name', action='store', type=str, help='wandb base run name', required=False, default='')
+
     parser.add_argument('--load_dir', action='store', type=str, help='dir to load checkpoint', required=False, default=None)
     parser.add_argument('--ckpt_name', action='store', type=str, help='name of checkpoint', required=False, default=None)
     parser.add_argument('--use_distributed', action='store', type=bool, help='whether to use ddp mode', required=False, default=False)

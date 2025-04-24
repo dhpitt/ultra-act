@@ -59,7 +59,7 @@ def get_args_parser():
     # repeat args in imitate_episodes just to avoid error. Will not be used
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--onscreen_render', action='store_true')
-    parser.add_argument('--ckpt_name', action='store', type=str, help='ckpt_name', required=False)
+    parser.add_argument('--ckpt_dir', action='store', type=str, help='ckpt_dir', required=False)
     parser.add_argument('--policy_class', action='store', type=str, help='policy_class, capitalize', required=True)
     parser.add_argument('--task_name', action='store', type=str, help='task_name', required=True)
     parser.add_argument('--seed', action='store', type=int, help='seed', required=True)
@@ -69,10 +69,15 @@ def get_args_parser():
     parser.add_argument('--temporal_agg', action='store_true')
 
     # david's added args
-    parser.add_argument('--ckpt_dir', action='store', type=str, help='ckpt_dir', required=True)
-    parser.add_argument('--load_dir', action='store', type=str, help='load_dir', required=False)
-    parser.add_argument('--use_distributed', action='store', type=bool, help='whether to use ddp mode', required=False, default=False)
+    
+    parser.add_argument('--wandb_log', action='store', type=str, help='log to wandb', required=False, default=None)
+    parser.add_argument('--wandb_entity', action='store', type=str, help='wandb username', required=False, default=None)
+    parser.add_argument('--wandb_project', action='store', type=str, help='wandb proj', required=False, default=None)
+    parser.add_argument('--wandb_name', action='store', type=str, help='wandb run name', required=False, default=None)
 
+    parser.add_argument('--ckpt_name', action='store', type=str, help='ckpt_name', required=False)
+    parser.add_argument('--load_dir', action='store', type=str, help='dir to load checkpoint', required=False, default=None)
+    parser.add_argument('--use_distributed', action='store', type=bool, help='whether to use ddp mode', required=False, default=False)
     return parser
 
 
