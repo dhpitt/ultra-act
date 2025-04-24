@@ -31,6 +31,16 @@ def main(args):
     # command line parameters
     is_eval = args['eval']
     ckpt_dir = args['ckpt_dir']
+    load_dir = args['load_dir']
+    if load_dir is None:
+        load_dir = ckpt_dir
+        print(f"load_dir not set. Setting to {ckpt_dir}")
+
+    ckpt_name = args['ckpt_name']
+    if ckpt_name is None:
+        ckpt_name = 'best_policy.ckpt'
+        print(f"ckpt_name not set. Setting to {ckpt_name}")
+
     policy_class = args['policy_class']
     onscreen_render = args['onscreen_render']
     task_name = args['task_name']
@@ -105,28 +115,35 @@ def main(args):
     if wandb_log:
         # Use basename from args and add info from current run
         wandb_name = task_config.get('wandb_name', '')
-        name_keywords = ['task_name', 'real_robot', 'policy_class']
 
-        for kw in name_keywords:
-            wandb_name += f'_{kw}=' + str(config[kw]) + '_'
+        wandb_name += f'_policy=' + str(policy_class)
+        wandb_name += f'_task=' + str(task_name)
 
-        wandb_name += str(datetime.now())
+        now = datetime.now()
+        wandb_name += f"_{now.month}-{now.day}-{now.hour}-{now.minute}-{now.second}"
 
         wandb.init(entity=task_config['wandb_entity'],
                 project=task_config['wandb_project'],
                 name=wandb_name)
 
+        # update checkpoint directory with wandb run name
+        print(f"WandB log: overwriting checkpoint directory to {wandb_name}")
+        ckpt_dir += f"/{wandb_name}"
+        config['ckpt_dir'] += f"/{wandb_name}"
+
         wandb.log(config, step=None)
 
     if is_eval:
-        ckpt_names = [f'policy_best.ckpt']
+        ckpt_names = [args['ckpt_name']]
         results = []
         for ckpt_name in ckpt_names:
-            success_rate, avg_return = eval_bc(config, ckpt_name, save_episode=True)
+            success_rate, avg_return = eval_bc(config, load_dir, ckpt_name, save_episode=True)
             if wandb_log:
-                wandb.log({'eval_ckpt_name': ckpt_name, 
-                       'eval_success_rate': success_rate,
-                       'eval_avg_return': avg_return}, step=None)
+                wandb.log({f'{ckpt_name}_eval_results': { 
+                    'eval_success_rate': success_rate,
+                        'eval_avg_return': avg_return
+                        }
+                       }, step=None)
             results.append([ckpt_name, success_rate, avg_return])
 
         for ckpt_name, success_rate, avg_return in results:
@@ -139,11 +156,15 @@ def main(args):
     # save dataset stats
     if not os.path.isdir(ckpt_dir):
         os.makedirs(ckpt_dir)
+    # if checkpoint dir exists, shutdown
+    else:
+        raise FileExistsError(f"Checkpoint dir already exists at {ckpt_dir}. Shutting down.")
+
     stats_path = os.path.join(ckpt_dir, f'dataset_stats.pkl')
     with open(stats_path, 'wb') as f:
         pickle.dump(stats, f)
 
-    best_ckpt_info = train_bc(train_dataloader, val_dataloader, config)
+    best_ckpt_info = train_bc(train_dataloader, val_dataloader, config, save_dir=ckpt_dir)
     best_epoch, min_val_loss, best_state_dict = best_ckpt_info
 
     # save best checkpoint
@@ -182,9 +203,8 @@ def get_image(ts, camera_names):
     return curr_image
 
 
-def eval_bc(config, ckpt_name, save_episode=True):
+def eval_bc(config, ckpt_dir, ckpt_name, save_episode=True):
     set_seed(1000)
-    ckpt_dir = config['ckpt_dir']
     state_dim = config['state_dim']
     real_robot = config['real_robot']
     policy_class = config['policy_class']
@@ -355,9 +375,8 @@ def forward_pass(data, policy):
     return policy(qpos_data, image_data, action_data, is_pad) # TODO remove None
 
 
-def train_bc(train_dataloader, val_dataloader, config):
+def train_bc(train_dataloader, val_dataloader, config, save_dir):
     num_epochs = config['num_epochs']
-    ckpt_dir = config['ckpt_dir']
     seed = config['seed']
     policy_class = config['policy_class']
     policy_config = config['policy_config']
@@ -428,20 +447,20 @@ def train_bc(train_dataloader, val_dataloader, config):
         #print(summary_string)
 
         if epoch % 100 == 0:
-            ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{epoch}_seed_{seed}.ckpt')
+            ckpt_path = os.path.join(save_dir, f'policy_epoch_{epoch}_seed_{seed}.ckpt')
             torch.save(policy.state_dict(), ckpt_path)
-            plot_history(train_history, validation_history, epoch, ckpt_dir, seed)
+            plot_history(train_history, validation_history, epoch, save_dir, seed)
 
-    ckpt_path = os.path.join(ckpt_dir, f'policy_last.ckpt')
+    ckpt_path = os.path.join(save_dir, f'policy_last.ckpt')
     torch.save(policy.state_dict(), ckpt_path)
 
     best_epoch, min_val_loss, best_state_dict = best_ckpt_info
-    ckpt_path = os.path.join(ckpt_dir, f'policy_epoch_{best_epoch}_seed_{seed}.ckpt')
+    ckpt_path = os.path.join(save_dir, f'best_policy_epoch_{best_epoch}_seed_{seed}.ckpt')
     torch.save(best_state_dict, ckpt_path)
     print(f'Training finished:\nSeed {seed}, val loss {min_val_loss:.6f} at epoch {best_epoch}')
 
     # save training curves
-    plot_history(train_history, validation_history, num_epochs, ckpt_dir, seed)
+    plot_history(train_history, validation_history, num_epochs, save_dir, seed)
 
     return best_ckpt_info
 
@@ -467,14 +486,15 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--onscreen_render', action='store_true')
-    parser.add_argument('--ckpt_dir', action='store', type=str, help='ckpt_dir', required=True)
+    parser.add_argument('--ckpt_dir', action='store', type=str, help='dir to save checkpoints', required=True)
+    parser.add_argument('--load_dir', action='store', type=str, help='dir to load checkpoint', required=False, default=None)
+    parser.add_argument('--ckpt_name', action='store', type=str, help='name of checkpoint', required=False, default=None)
     parser.add_argument('--policy_class', action='store', type=str, help='policy_class, capitalize', required=True)
     parser.add_argument('--task_name', action='store', type=str, help='task_name', required=True)
     parser.add_argument('--batch_size', action='store', type=int, help='batch_size', required=True)
     parser.add_argument('--seed', action='store', type=int, help='seed', required=True)
     parser.add_argument('--num_epochs', action='store', type=int, help='num_epochs', required=True)
     parser.add_argument('--lr', action='store', type=float, help='lr', required=True)
-    parser.add_argument('--wandb_log', action='store', type=bool, help='log to wandb?', required=False)
 
     # for ACT
     parser.add_argument('--kl_weight', action='store', type=int, help='KL Weight', required=False)

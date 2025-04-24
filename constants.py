@@ -32,7 +32,7 @@ SIM_TASK_CONFIGS = {
         'camera_names': ['top'],
         'wandb_entity': WANDB_ENTITY,
         'wandb_project': WANDB_PROJECT,
-        'wandb_name': 'setup',
+        'wandb_name': 'warmup',
         'wandb_log': True,
 
     },
