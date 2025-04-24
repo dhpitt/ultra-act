@@ -11,6 +11,11 @@ from einops import rearrange
 import wandb
 from datetime import datetime
 
+# Utils for DDP setup
+import torch.distributed as dist
+from torch.utils.data import DataLoader, DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+
 from constants import DT
 from constants import PUPPET_GRIPPER_JOINT_OPEN 
 from utils import load_data # data functions
@@ -23,7 +28,6 @@ from sim_env import BOX_POSE
 
 import IPython
 e = IPython.embed
-
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
 def main(args):
@@ -47,6 +51,32 @@ def main(args):
     batch_size_train = args['batch_size']
     batch_size_val = args['batch_size']
     num_epochs = args['num_epochs']
+
+    # setup device/DDP if using
+
+    # only rank 0 process will print to stdout and save checkpoints
+    is_logger = True
+    device_id = 0
+
+    if torch.cuda.is_available():
+        use_distributed = args['use_distributed']
+        if use_distributed:
+            local_rank = int(os.getenv("LOCAL_RANK", 0))
+            global_rank = int(os.getenv("RANK", 0))
+            world_size = torch.cuda.device_count()
+            if world_size > 0:
+                print(f"Dummy warning for single-gpu world.")
+                dist.init_process_group(backend='nccl', rank=local_rank)
+                # set a barrier until all processes reach this point
+                dist.barrier(device_ids=[local_rank])
+                device_id = dist.get_rank()
+                device = torch.device(f"cuda:{device_id}")
+                torch.cuda.set_device(device)
+                # other rank processes don't log
+                is_logger = (device_id == 0)
+        else:
+            device = 'cuda'
+
 
     # get task parameters
     is_sim = task_name[:4] == 'sim_'
@@ -109,10 +139,8 @@ def main(args):
         'wandb_log': wandb_log
     }
 
-    # log to wandb if set
-    print(f"{wandb_log=}")
-    
-    if wandb_log:
+        
+    if wandb_log and is_logger:
         # Use basename from args and add info from current run
         wandb_name = task_config.get('wandb_name', '')
 
@@ -137,8 +165,10 @@ def main(args):
         ckpt_names = [args['ckpt_name']]
         results = []
         for ckpt_name in ckpt_names:
-            success_rate, avg_return = eval_bc(config, load_dir, ckpt_name, save_episode=True)
-            if wandb_log:
+            success_rate, avg_return = eval_bc(config, load_dir, ckpt_name, 
+                                               use_distributed=use_distributed, device=device, is_logger=is_logger,
+                                               save_episode=True)
+            if wandb_log and is_logger:
                 wandb.log({f'{ckpt_name}_eval_results': { 
                     'eval_success_rate': success_rate,
                         'eval_avg_return': avg_return
@@ -147,30 +177,51 @@ def main(args):
             results.append([ckpt_name, success_rate, avg_return])
 
         for ckpt_name, success_rate, avg_return in results:
-            print(f'{ckpt_name}: {success_rate=} {avg_return=}')
+            if is_logger:
+                print(f'{ckpt_name}: {success_rate=} {avg_return=}')
         print()
         exit()
 
     train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val)
 
-    # save dataset stats
-    if not os.path.isdir(ckpt_dir):
-        os.makedirs(ckpt_dir)
-    # if checkpoint dir exists, shutdown
-    else:
-        raise FileExistsError(f"Checkpoint dir already exists at {ckpt_dir}. Shutting down.")
+    # Use distributed sampling to avoid reusing examples in DDP mode
+    if use_distributed and dist.is_initialized():
+        train_db = train_dataloader.dataset
+        train_batch_size = train_dataloader.batch_size
+        train_sampler = DistributedSampler(train_db, rank=dist.get_rank())
+        train_dataloader = DataLoader(dataset=train_db,
+                                batch_size=train_batch_size,
+                                sampler=train_sampler)
 
-    stats_path = os.path.join(ckpt_dir, f'dataset_stats.pkl')
-    with open(stats_path, 'wb') as f:
-        pickle.dump(stats, f)
+        val_db = val_dataloader.dataset
+        val_batch_size = val_dataloader.batch_size
+        val_sampler = DistributedSampler(val_db, rank=dist.get_rank())
+        val_dataloader = DataLoader(dataset=val_db,
+                              batch_size=val_batch_size,
+                              shuffle=False,
+                              sampler=val_sampler)
 
-    best_ckpt_info = train_bc(train_dataloader, val_dataloader, config, save_dir=ckpt_dir)
+    # save stats if and only if rank==0
+    if is_logger:
+        if not os.path.isdir(ckpt_dir):
+            os.makedirs(ckpt_dir)
+        # if checkpoint dir exists, shutdown
+        else:
+            raise FileExistsError(f"Checkpoint dir already exists at {ckpt_dir}. Shutting down.")
+
+        stats_path = os.path.join(ckpt_dir, f'dataset_stats.pkl')
+        with open(stats_path, 'wb') as f:
+            pickle.dump(stats, f)
+
+    best_ckpt_info = train_bc(train_dataloader, val_dataloader, config, 
+                            save_dir=ckpt_dir, use_distributed=use_distributed, device=device, is_logger=is_logger)
     best_epoch, min_val_loss, best_state_dict = best_ckpt_info
 
-    # save best checkpoint
-    ckpt_path = os.path.join(ckpt_dir, f'policy_best.ckpt')
-    torch.save(best_state_dict, ckpt_path)
-    print(f'Best ckpt, val loss {min_val_loss:.6f} @ epoch{best_epoch}')
+    # save best checkpoint if logging/rank==0
+    if is_logger:
+        ckpt_path = os.path.join(ckpt_dir, f'policy_best.ckpt')
+        torch.save(best_state_dict, ckpt_path)
+        print(f'Best ckpt, val loss {min_val_loss:.6f} @ epoch{best_epoch}')
 
 
 def make_policy(policy_class, policy_config):
@@ -203,7 +254,8 @@ def get_image(ts, camera_names):
     return curr_image
 
 
-def eval_bc(config, ckpt_dir, ckpt_name, save_episode=True):
+def eval_bc(config, ckpt_dir, ckpt_name, 
+            use_distributed, device, is_logger, save_episode=True):
     set_seed(1000)
     state_dim = config['state_dim']
     real_robot = config['real_robot']
@@ -219,9 +271,15 @@ def eval_bc(config, ckpt_dir, ckpt_name, save_episode=True):
     # load policy and stats
     ckpt_path = os.path.join(ckpt_dir, ckpt_name)
     policy = make_policy(policy_class, policy_config)
-    loading_status = policy.load_state_dict(torch.load(ckpt_path))
+    policy = policy.to(device)
+    if use_distributed and dist.is_initialized():
+        print('dist')
+        policy = DDP(policy, device_ids=[dist.get_rank()], output_device=dist.get_rank())
+        state_dict = torch.load(ckpt_path, map_location=f"cuda:{dist.get_rank()}")
+        loading_status = policy.module.load_state_dict(state_dict)
+    else:
+        loading_status = policy.load_state_dict(torch.load(ckpt_path))
     print(loading_status)
-    policy.to(device)
     policy.eval()
     print(f'Loaded: {ckpt_path}')
     stats_path = os.path.join(ckpt_dir, f'dataset_stats.pkl')
@@ -375,9 +433,12 @@ def forward_pass(data, policy):
     return policy(qpos_data, image_data, action_data, is_pad) # TODO remove None
 
 
-def train_bc(train_dataloader, val_dataloader, config, save_dir):
+def train_bc(train_dataloader, val_dataloader, config, save_dir, device, is_logger, use_distributed,):
     num_epochs = config['num_epochs']
-    seed = config['seed']
+    seed = config['seed'] 
+    
+    if use_distributed and dist.is_initialized():
+        seed += dist.get_rank()
     policy_class = config['policy_class']
     policy_config = config['policy_config']
     wandb_log = config.get('wandb_log')
@@ -386,6 +447,10 @@ def train_bc(train_dataloader, val_dataloader, config, save_dir):
 
     policy = make_policy(policy_class, policy_config)
     policy.to(device)
+    
+    if use_distributed and dist.is_initialized():
+        policy.model = DDP(policy.model, device_ids=[dist.get_rank()], output_device=dist.get_rank())
+
     optimizer = make_optimizer(policy_class, policy)
 
     train_history = []
@@ -487,14 +552,18 @@ if __name__ == '__main__':
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--onscreen_render', action='store_true')
     parser.add_argument('--ckpt_dir', action='store', type=str, help='dir to save checkpoints', required=True)
-    parser.add_argument('--load_dir', action='store', type=str, help='dir to load checkpoint', required=False, default=None)
-    parser.add_argument('--ckpt_name', action='store', type=str, help='name of checkpoint', required=False, default=None)
+   
     parser.add_argument('--policy_class', action='store', type=str, help='policy_class, capitalize', required=True)
     parser.add_argument('--task_name', action='store', type=str, help='task_name', required=True)
     parser.add_argument('--batch_size', action='store', type=int, help='batch_size', required=True)
     parser.add_argument('--seed', action='store', type=int, help='seed', required=True)
     parser.add_argument('--num_epochs', action='store', type=int, help='num_epochs', required=True)
     parser.add_argument('--lr', action='store', type=float, help='lr', required=True)
+
+    # david's args
+    parser.add_argument('--load_dir', action='store', type=str, help='dir to load checkpoint', required=False, default=None)
+    parser.add_argument('--ckpt_name', action='store', type=str, help='name of checkpoint', required=False, default=None)
+    parser.add_argument('--use_distributed', action='store', type=bool, help='whether to use ddp mode', required=False, default=False)
 
     # for ACT
     parser.add_argument('--kl_weight', action='store', type=int, help='KL Weight', required=False)
