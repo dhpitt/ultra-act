@@ -155,9 +155,10 @@ def main(args):
                 name=wandb_name)
 
         # update checkpoint directory with wandb run name
-        print(f"WandB log: overwriting checkpoint directory to {wandb_name}")
-        ckpt_dir += f"/{wandb_name}"
-        config['ckpt_dir'] += f"/{wandb_name}"
+        if ckpt_dir is not None:
+            print(f"WandB log: overwriting checkpoint directory to {wandb_name}")
+            ckpt_dir += f"/{wandb_name}"
+            config['ckpt_dir'] += f"/{wandb_name}"
 
         wandb.log(config, step=None)
 
@@ -202,7 +203,7 @@ def main(args):
                               sampler=val_sampler)
 
     # save stats if and only if rank==0
-    if is_logger:
+    if is_logger and ckpt_dir is not None:
         if not os.path.isdir(ckpt_dir):
             os.makedirs(ckpt_dir)
         # if checkpoint dir exists, shutdown
@@ -218,7 +219,7 @@ def main(args):
     best_epoch, min_val_loss, best_state_dict = best_ckpt_info
 
     # save best checkpoint if logging/rank==0
-    if is_logger:
+    if is_logger and ckpt_dir is not None:
         ckpt_path = os.path.join(ckpt_dir, f'policy_best.ckpt')
         torch.save(best_state_dict, ckpt_path)
         print(f'Best ckpt, val loss {min_val_loss:.6f} @ epoch{best_epoch}')
@@ -271,14 +272,17 @@ def eval_bc(config, ckpt_dir, ckpt_name,
     # load policy and stats
     ckpt_path = os.path.join(ckpt_dir, ckpt_name)
     policy = make_policy(policy_class, policy_config)
-    policy = policy.to(device)
+    
     if use_distributed and dist.is_initialized():
         print('dist')
+        policy.to(device)
         policy = DDP(policy, device_ids=[dist.get_rank()], output_device=dist.get_rank())
         state_dict = torch.load(ckpt_path, map_location=f"cuda:{dist.get_rank()}")
-        loading_status = policy.module.load_state_dict(state_dict)
+        loading_status = policy.module.load_state_dict(state_dict, strict=True)
     else:
-        loading_status = policy.load_state_dict(torch.load(ckpt_path))
+        loading_status = policy.load_state_dict(torch.load(ckpt_path), strict=True)
+        policy.to(device)
+
     print(loading_status)
     policy.eval()
     print(f'Loaded: {ckpt_path}')
@@ -417,12 +421,13 @@ def eval_bc(config, ckpt_dir, ckpt_name,
     print(summary_str)
 
     # save success rate to txt
-    result_file_name = 'result_' + ckpt_name.split('.')[0] + '.txt'
-    with open(os.path.join(ckpt_dir, result_file_name), 'w') as f:
-        f.write(summary_str)
-        f.write(repr(episode_returns))
-        f.write('\n\n')
-        f.write(repr(highest_rewards))
+    if ckpt_dir is not None:
+        result_file_name = 'result_' + ckpt_name.split('.')[0] + '.txt'
+        with open(os.path.join(ckpt_dir, result_file_name), 'w') as f:
+            f.write(summary_str)
+            f.write(repr(episode_returns))
+            f.write('\n\n')
+            f.write(repr(highest_rewards))
 
     return success_rate, avg_return
 
@@ -511,21 +516,23 @@ def train_bc(train_dataloader, val_dataloader, config, save_dir, device, is_logg
         progress_bar.set_postfix_str(f"Train: {train_summary_string} | Val: {val_summary_string}")
         #print(summary_string)
 
-        if epoch % 100 == 0:
+        if epoch % 100 == 0 and save_dir is not None:
             ckpt_path = os.path.join(save_dir, f'policy_epoch_{epoch}_seed_{seed}.ckpt')
             torch.save(policy.state_dict(), ckpt_path)
             plot_history(train_history, validation_history, epoch, save_dir, seed)
 
-    ckpt_path = os.path.join(save_dir, f'policy_last.ckpt')
-    torch.save(policy.state_dict(), ckpt_path)
+    if save_dir is not None:
+        ckpt_path = os.path.join(save_dir, f'policy_last.ckpt')
+        torch.save(policy.state_dict(), ckpt_path)
 
-    best_epoch, min_val_loss, best_state_dict = best_ckpt_info
-    ckpt_path = os.path.join(save_dir, f'best_policy_epoch_{best_epoch}_seed_{seed}.ckpt')
-    torch.save(best_state_dict, ckpt_path)
+        best_epoch, min_val_loss, best_state_dict = best_ckpt_info
+        ckpt_path = os.path.join(save_dir, f'best_policy_epoch_{best_epoch}_seed_{seed}.ckpt')
+        torch.save(best_state_dict, ckpt_path)
     print(f'Training finished:\nSeed {seed}, val loss {min_val_loss:.6f} at epoch {best_epoch}')
 
     # save training curves
-    plot_history(train_history, validation_history, num_epochs, save_dir, seed)
+    if save_dir is not None:
+        plot_history(train_history, validation_history, num_epochs, save_dir, seed)
 
     return best_ckpt_info
 
@@ -552,7 +559,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--eval', action='store_true')
     parser.add_argument('--onscreen_render', action='store_true')
-    parser.add_argument('--ckpt_dir', action='store', type=str, help='dir to save checkpoints', required=True)
+    parser.add_argument('--ckpt_dir', action='store', type=str, help='dir to save checkpoints', required=False, default=None)
    
     parser.add_argument('--policy_class', action='store', type=str, help='policy_class, capitalize', required=True)
     parser.add_argument('--task_name', action='store', type=str, help='task_name', required=True)

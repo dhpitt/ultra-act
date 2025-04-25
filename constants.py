@@ -38,8 +38,6 @@ SIM_TASK_CONFIGS = {
         'num_episodes': 50,
         'episode_len': 500,
         'camera_names': ['top'],
-        'wandb_entity': WANDB_ENTITY,
-        'wandb_project': WANDB_PROJECT,
     },
 
     'sim_pickup_scripted': {
