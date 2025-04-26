@@ -8,7 +8,7 @@ import IPython
 e = IPython.embed
 
 class EpisodicDataset(torch.utils.data.Dataset):
-    def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats, drop_last_frames=None):
+    def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats, drop_last_frames=None, n_obs_steps=None, horizon=None):
         super(EpisodicDataset).__init__()
         self.episode_ids = episode_ids
         self.dataset_dir = dataset_dir
@@ -16,6 +16,14 @@ class EpisodicDataset(torch.utils.data.Dataset):
         self.norm_stats = norm_stats
         self.is_sim = None
         self.drop_last_frames = drop_last_frames
+        self.n_obs_steps = n_obs_steps
+        self.horizon = horizon
+
+        if self.horizon is not None:
+            assert self.n_obs_steps is not None
+        if self.n_obs_steps is not None:
+            assert self.horizon is not None
+        
         self.__getitem__(0) # initialize self.is_sim
 
     def __len__(self):
@@ -33,13 +41,22 @@ class EpisodicDataset(torch.utils.data.Dataset):
             if sample_full_episode:
                 start_ts = 0
             else:
-                start_ts = np.random.choice(episode_len)
+                if self.n_obs_steps is None:
+                    start_ts = np.random.choice(episode_len)
+                else:
+                    start_ts = 1 + np.random.choice(episode_len - self.horizon - 1) # start at 1
             # get observation at start_ts only
-            qpos = root['/observations/qpos'][start_ts]
-            qvel = root['/observations/qvel'][start_ts]
+            if self.n_obs_steps is None:
+                qpos = root['/observations/qpos'][start_ts]
+            else:  
+                qpos = root['/observations/qpos'][start_ts:start_ts+self.n_obs_steps]
+            #qvel = root['/observations/qvel'][start_ts]
             image_dict = dict()
             for cam_name in self.camera_names:
-                image_dict[cam_name] = root[f'/observations/images/{cam_name}'][start_ts]
+                if self.n_obs_steps is None:
+                    image_dict[cam_name] = root[f'/observations/images/{cam_name}'][start_ts]
+                else:
+                    image_dict[cam_name] = root[f'/observations/images/{cam_name}'][start_ts:start_ts+self.n_obs_steps]
             # get all actions after and including start_ts
             if is_sim:
                 action = root['/action'][start_ts:]
@@ -47,6 +64,10 @@ class EpisodicDataset(torch.utils.data.Dataset):
             else:
                 action = root['/action'][max(0, start_ts - 1):] # hack, to make timesteps more aligned
                 action_len = episode_len - max(0, start_ts - 1) # hack, to make timesteps more aligned
+            
+            '''if self.horizon is not None:
+                action = action[:self.horizon] # hack, to make timesteps more aligned
+                action_len = self.horizon # hack, to make timesteps more aligned'''
 
         self.is_sim = is_sim
         padded_action = np.zeros(original_action_shape, dtype=np.float32)
@@ -67,17 +88,23 @@ class EpisodicDataset(torch.utils.data.Dataset):
         is_pad = torch.from_numpy(is_pad).bool()
 
         # channel last
-        image_data = torch.einsum('k h w c -> k c h w', image_data)
+        if self.n_obs_steps is None:
+            image_data = torch.einsum('k h w c -> k c h w', image_data)
+        else:
+            image_data = torch.einsum('k n h w c -> k n c h w', image_data)
 
         # normalize image and change dtype to float
         image_data = image_data / 255.0
         action_data = (action_data - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
         qpos_data = (qpos_data - self.norm_stats["qpos_mean"]) / self.norm_stats["qpos_std"]
 
-        if self.drop_last_frames is not None:
+        '''print(f"{image_data.shape=}")
+        print(f"{action_data.shape=}")
+        print(f"{qpos_data.shape=}")'''
+        '''if self.drop_last_frames is not None:
             action_data = action_data[:-self.drop_last_frames]
             qpos_data = qpos_data[:-self.drop_last_frames]
-            is_pad = is_pad[:-self.drop_last_frames]
+            is_pad = is_pad[:-self.drop_last_frames]'''
 
         return image_data, qpos_data, action_data, is_pad
 
@@ -114,7 +141,7 @@ def get_norm_stats(dataset_dir, num_episodes):
     return stats
 
 
-def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val, drop_last_frames):
+def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val, drop_last_frames, horizon, n_obs_steps):
     print(f'\nData from: {dataset_dir}\n')
     # obtain train test split
     train_ratio = 0.8
@@ -126,15 +153,21 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
     norm_stats = get_norm_stats(dataset_dir, num_episodes)
 
     # construct dataset and dataloader
-    train_dataset = EpisodicDataset(train_indices, dataset_dir, camera_names, norm_stats, drop_last_frames=drop_last_frames)
+    train_dataset = EpisodicDataset(train_indices, dataset_dir, camera_names, norm_stats, 
+                                    drop_last_frames=drop_last_frames,n_obs_steps=n_obs_steps, horizon=horizon)
     images, obs, action, _ = train_dataset[0]
+    '''
+    print(f"{images.shape=}")
+    print(f"{obs.shape=}")
+    print(f"{action.shape=}")'''
     # store shapes of one batch for constructing diffusionpolicy
-    norm_stats["ds_meta"] = {
+    norm_stats["ds_meta"] = dict({
         "observation.image": images.shape,
         "observation.state": obs.shape,
         "action": action.shape
-    },
-    val_dataset = EpisodicDataset(val_indices, dataset_dir, camera_names, norm_stats, drop_last_frames=drop_last_frames)
+    })
+    val_dataset = EpisodicDataset(val_indices, dataset_dir, camera_names, norm_stats, 
+                                  drop_last_frames=drop_last_frames,n_obs_steps=n_obs_steps, horizon=horizon)
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size_train, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size_val, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)
 

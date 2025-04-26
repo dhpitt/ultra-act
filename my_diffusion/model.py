@@ -163,10 +163,11 @@ class DiffusionPolicy(nn.Module):
         """Run the batch through the model and compute the loss for training or validation."""
         ## Training/val
         if actions is not None:
+            actions = actions[:, :self.horizon]
             loss = self.diffusion.compute_loss(qpos, images, actions, is_pad)
             loss_dict = {'mse': loss, 'loss': loss}
             # no output_dict so returning None
-            return loss
+            return loss_dict
         ## inference
         else:
             a_hat = self.select_action(qpos, images, actions, is_pad)
@@ -210,6 +211,7 @@ class DiffusionModel(nn.Module):
         self.n_action_steps=n_action_steps
         self.horizon=horizon
         self.drop_n_last_frames = drop_n_last_frames
+        self.prediction_type = "epsilon" # hardcoded diffusion
 
         # Build observation encoders (depending on which observations are provided).
         global_cond_dim = qpos_dim
@@ -297,21 +299,22 @@ class DiffusionModel(nn.Module):
         """Encode image features and concatenate them all together along with the state vector."""
         batch_size, n_obs_steps = qpos.shape[:2]
         global_cond_feats = [qpos]
-        print(f"{images.shape=}")
+        #print(f"{images.shape=}")
         # Extract image features.
         if self.use_separate_backbone_per_camera:
-            # images come in b, n_cameras, c, h, w == one image per action
-
+            # images come in b, n_cameras, n_obs, c, h, w == one image per action
+            # Combine batch and sequence dims while rearranging to make the camera index dimension first.
+            images = einops.rearrange(images, "b n s ... -> n (b s) ...")
             # Combine batch and sequence dims while rearranging to make the camera index dimension first.
             img_features = []
             for i, backbone in enumerate(self.backbone):
-                img_features.append(backbone(images[:, i])) # grab the n-th camera's images
+                img_features.append(backbone(images[i])) # grab the n-th camera's images
             img_features = torch.cat(img_features,dim=0) # n, b, (shape)
             # Separate batch and sequence dims back out. The camera index dim gets absorbed into the
             # feature dim (effectively concatenating the camera features).
             img_features = einops.rearrange(
-                img_features, "(n b) ... -> b s (n ...)", b=batch_size,s=1
-            ).repeat(1, n_obs_steps, 1) # in diffusion policy we have 1 img per obs step. Repeat to match ACT
+                img_features, "(n b s) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
+            )
         else:
             raise NotImplementedError()
             '''# Combine batch, sequence, and "which camera" dims before passing to shared encoder.
@@ -546,8 +549,8 @@ class DiffusionRgbEncoder(nn.Module):
 
         # Note: we have a check in the config class to make sure all images have the same shape.
         
-        dummy_shape_h_w = crop_shape if crop_shape is not None else image_shape[2:] # h w
-        dummy_shape = (1, image_shape[1], *dummy_shape_h_w)
+        dummy_shape_c_h_w = crop_shape if crop_shape is not None else image_shape[-3:] # c, h, w
+        dummy_shape = (1, *dummy_shape_c_h_w)
         feature_map_shape = get_output_shape(self.backbone, dummy_shape)[1:]
 
         self.pool = SpatialSoftmax(feature_map_shape, num_kp=spatial_softmax_num_keypoints)

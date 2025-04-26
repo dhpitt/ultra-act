@@ -20,6 +20,9 @@ class ACTPolicy(nn.Module):
         env_state = None
         normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
                                          std=[0.229, 0.224, 0.225])
+        print(f"{qpos.shape=}")
+        print(f"{image.shape=}")
+        print(f"{actions.shape=}")
         image = normalize(image)
         if actions is not None: # training time
             actions = actions[:, :self.model.num_queries]

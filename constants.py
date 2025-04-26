@@ -26,10 +26,10 @@ SIM_TASK_CONFIGS = {
     },
 
     'sim_insertion_scripted': {
-        'dataset_dir': DATA_DIR + '/sim_insertion_scripted',
+        'dataset_dir': DATA_DIR + '/sim_insertion_scripted_multicam',
         'num_episodes': 50,
         'episode_len': 400,
-        'camera_names': ['top'],
+        'camera_names': ['top', 'angle', 'vis'],
 
     },
 
@@ -44,10 +44,9 @@ SIM_TASK_CONFIGS = {
         'dataset_dir': DATA_DIR + '/sim_pickup_scripted',
         'num_episodes': 10,
         'episode_len': 250,
-        'camera_names': ['top'],
+        #'camera_names': ['top','vis','angle'],
+        'camera_names': ['top','angle'],
         'state_dim': 7 ,
-        'wandb_entity': WANDB_ENTITY,
-        'wandb_project': WANDB_PROJECT
     }
 }
 

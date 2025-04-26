@@ -239,7 +239,9 @@ def main(args):
 
     # drop 7 last frames from each episode for diffusion policy, otherwise don't drop any frames
     train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val,
-                                                           drop_last_frames=policy_config.get('drop_n_last_frames', None))
+                                                           drop_last_frames=policy_config.get('drop_n_last_frames', None),
+                                                           horizon=policy_config.get('horizon', None),
+                                                           n_obs_steps=policy_config.get('n_obs_steps', None),)
     if config['policy_class'] == "Diffusion":
         config['policy_config']['img_shape'] = stats['ds_meta']['observation.image']
     # Use distributed sampling to avoid reusing examples in DDP mode
