@@ -10,6 +10,7 @@ from einops import rearrange
 
 import wandb
 from datetime import datetime
+from collections import deque
 
 # Utils for DDP setup
 import torch.distributed as dist
@@ -35,6 +36,7 @@ def main(args):
     set_seed(1)
     # command line parameters
     is_eval = args['eval']
+    eval_after = args['eval_after']
     ckpt_dir = args['ckpt_dir']
     load_dir = args['load_dir']
     if load_dir is None:
@@ -142,7 +144,7 @@ def main(args):
             # vision model params
             'camera_names': camera_names,
             'lr_backbone': lr_backbone,
-            'img_shape': None,
+            'img_shape': (3, 480,640),
             'n_groups': 8,
             'use_group_norm': False,
             'use_film_scale_modulation': True,
@@ -282,6 +284,17 @@ def main(args):
         ckpt_path = os.path.join(ckpt_dir, f'policy_best.ckpt')
         torch.save(best_state_dict, ckpt_path)
         print(f'Best ckpt, val loss {min_val_loss:.6f} @ epoch{best_epoch}')
+    
+    if eval_after:
+        load_dir = ckpt_dir
+        success_rate, avg_return = eval_bc(config, load_dir, ckpt_name='policy_best.ckpt', 
+            use_distributed=use_distributed, device=device, is_logger=is_logger,
+            save_episode=args['save_videos'])
+        print(f"{success_rate=} {avg_return=}")
+        if wandb_log:
+            wandb.log({'success_rate_post_training': success_rate, 
+                       'avg_return_post_training': avg_return})
+
 
 
 def make_policy(policy_class, policy_config):
@@ -367,10 +380,15 @@ def eval_bc(config, ckpt_dir, ckpt_name,
         env = make_sim_env(task_name)
         env_max_reward = env.task.max_reward
 
-    query_frequency = policy_config['num_queries']
-    if temporal_agg:
-        query_frequency = 1
-        num_queries = policy_config['num_queries']
+    if policy_class in ['ACT', 'CNNMLP']:
+        query_frequency = policy_config['num_queries']
+        if temporal_agg:
+            query_frequency = 1
+            num_queries = policy_config['num_queries']
+    elif policy_class == 'Diffusion':
+        query_frequency = policy_config['n_obs_steps']
+    else:
+        raise NotImplementedError()
 
     max_timesteps = int(max_timesteps * 1) # may increase for real-world tasks
 
@@ -404,8 +422,12 @@ def eval_bc(config, ckpt_dir, ckpt_name,
         qpos_list = []
         target_qpos_list = []
         rewards = []
+
+        multi_obs_qpos = deque(maxlen=query_frequency)
+        multi_obs_images = deque(maxlen=query_frequency)
         with torch.inference_mode():
             for t in range(max_timesteps):
+                
                 ### update onscreen render and wait for DT
                 if onscreen_render:
                     image = env._physics.render(height=480, width=640, camera_id=onscreen_cam)
@@ -420,9 +442,23 @@ def eval_bc(config, ckpt_dir, ckpt_name,
                     image_list.append({'main': obs['image']})
                 qpos_numpy = np.array(obs['qpos'])
                 qpos = pre_process(qpos_numpy)
+                
+                # stack n_obs_steps of qpos
+                multi_obs_qpos.append(qpos)
+                # initialize the queue of observations with repeats of qpos 0
+                while len(multi_obs_qpos) < query_frequency:
+                    multi_obs_qpos.append(qpos)
+
                 qpos = torch.from_numpy(qpos).float().to(device).unsqueeze(0)
                 qpos_history[:, t] = qpos
+
+                # stack n_obs_steps of img
                 curr_image = get_image(ts, camera_names)
+                multi_obs_images.append(curr_image)
+
+                # initialize the queue of observations with repeats of images 0
+                while len(multi_obs_images) < query_frequency:
+                    multi_obs_images.append(curr_image)
 
                 ### query policy
                 if config['policy_class'] == "ACT":
@@ -442,6 +478,22 @@ def eval_bc(config, ckpt_dir, ckpt_name,
                         raw_action = all_actions[:, t % query_frequency]
                 elif config['policy_class'] == "CNNMLP":
                     raw_action = policy(qpos, curr_image)
+                elif config['policy_class'] == "Diffusion":
+                    if t % query_frequency == 0:
+                        '''qpos_stack = np.stack(list(multi_obs_qpos)) # n, obs_dim
+
+                        # n_obs, n_cameras, c, h, w --> n_cams, n_obs, c, h, w
+                        images_stack = torch.cat(list(multi_obs_images),dim=0)
+                        images_stack = images_stack.permute(1,0,*list(range(2, images_stack.ndim))) 
+                        print(f"{images_stack.shape=}")
+f
+                        qpos = torch.from_numpy(qpos_stack).float().to(device).unsqueeze(0) # add batch dim
+                        images = images_stack.float().to(device).unsqueeze(0) # add batch dim
+
+                        print(f"in {qpos.shape=}")
+                        print(f"in {images.shape=}")'''
+                        all_actions = policy(qpos, curr_image) 
+                    raw_action = all_actions[:, t % query_frequency]
                 else:
                     raise NotImplementedError
 
@@ -641,6 +693,7 @@ if __name__ == '__main__':
     parser.add_argument('--ckpt_name', action='store', type=str, help='name of checkpoint', required=False, default=None)
     parser.add_argument('--use_distributed', action='store', type=bool, help='whether to use ddp mode', required=False, default=False)
     parser.add_argument('--save_videos', action='store', type=bool, help='whether to save videos in eval', required=False, default=False)
+    parser.add_argument('--eval_after', action='store', type=bool, help='whether to eval after training', required=False, default=False)
 
     # for ACT
     parser.add_argument('--kl_weight', action='store', type=int, help='KL Weight', required=False)

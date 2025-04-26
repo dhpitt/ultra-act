@@ -137,29 +137,33 @@ class DiffusionPolicy(nn.Module):
                                          std=[0.229, 0.224, 0.225])
         images = normalize(images)
 
+        # print(f"{qpos=}")
+        # print(f"{qpos.shape=}")
+
         
-        if self.image_features:
+        '''if self.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch["observation.images"] = torch.stack(
                 [batch[key] for key in self.image_features], dim=-4
-            )
+            )'''
         # Note: It's important that this happens after stacking the images into a single key.
         if actions is not None:
             self._action_queue = populate_single_queue(self._action_queue, actions)
-        self._obs_queue = populate_single_queue(self._obs_queue)
-        self._image_queue = populate_single_queue(self._image_queue)
+        self._qpos_queue = populate_single_queue(self._qpos_queue, qpos)
+        self._image_queue = populate_single_queue(self._image_queue, images)
         
         if len(self._action_queue) == 0:
             # stack n latest observations from the queue
-            batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
-            a_hat = self.diffusion.generate_actions(batch)
+            qpos_batch = torch.stack(list(self._qpos_queue), dim=1)
+            img_batch = torch.stack(list(self._image_queue), dim=2) #b, n_cam, c, h, w --> b, n_cam, n_obs, c, h, w 
+            a_hat = self.diffusion.generate_actions(qpos_batch, img_batch)
 
             self._action_queue.extend(a_hat.transpose(0, 1))
 
         action = self._action_queue.popleft()
         return action
 
-    def forward(self, qpos, images, actions, is_pad) -> tuple[Tensor, None]:
+    def forward(self, qpos, images, actions=None, is_pad=None) -> tuple[Tensor, None]:
         """Run the batch through the model and compute the loss for training or validation."""
         ## Training/val
         if actions is not None:
@@ -275,7 +279,7 @@ class DiffusionModel(nn.Module):
 
         # Sample prior.
         sample = torch.randn(
-            size=(batch_size, self.horizon, self.action_feature.shape[0]),
+            size=(batch_size, self.horizon, self.act_dim),
             dtype=dtype,
             device=device,
             generator=generator,
@@ -343,7 +347,8 @@ class DiffusionModel(nn.Module):
             "observation.environment_state": (B, environment_dim)
         }
         """
-        batch_size, n_obs_steps = qpos
+        # print(f"in generate, {qpos.shape=}")
+        batch_size, n_obs_steps, _ = qpos.shape
         assert n_obs_steps == self.n_obs_steps
 
         # Encode image features and concatenate them all together along with the state vector.
@@ -376,9 +381,7 @@ class DiffusionModel(nn.Module):
         # Input validation.
         n_obs_steps = qpos.shape[1]
         horizon = action.shape[1]
-        print(f"{qpos.shape=}")
-        print(f"{images.shape=}")
-        print(f"{action.shape=}")
+
         assert horizon == self.horizon
         assert n_obs_steps == self.n_obs_steps
 

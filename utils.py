@@ -89,9 +89,9 @@ class EpisodicDataset(torch.utils.data.Dataset):
 
         # channel last
         if self.n_obs_steps is None:
-            image_data = torch.einsum('k h w c -> k c h w', image_data)
+            image_data = torch.einsum('k h w c -> k c h w', image_data) # ncams, c, h, e
         else:
-            image_data = torch.einsum('k n h w c -> k n c h w', image_data)
+            image_data = torch.einsum('k n h w c -> k n c h w', image_data) # n_cams, n_obs, c, h, w
 
         # normalize image and change dtype to float
         image_data = image_data / 255.0
