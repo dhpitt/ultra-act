@@ -78,6 +78,8 @@ def get_args_parser():
     parser.add_argument('--ckpt_name', action='store', type=str, help='ckpt_name', required=False)
     parser.add_argument('--load_dir', action='store', type=str, help='dir to load checkpoint', required=False, default=None)
     parser.add_argument('--use_distributed', action='store', type=bool, help='whether to use ddp mode', required=False, default=False)
+    parser.add_argument('--save_videos', action='store', type=bool, help='whether to save videos in eval', required=False, default=False)
+
     return parser
 
 
