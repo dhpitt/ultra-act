@@ -24,8 +24,6 @@ from utils import (
     populate_single_queue
 )
 
-
-
 class DiffusionPolicy(nn.Module):
     """
     Diffusion Policy as per "Diffusion Policy: Visuomotor Policy Learning via Action Diffusion"
@@ -46,6 +44,12 @@ class DiffusionPolicy(nn.Module):
         down_dims=(512,1024,2048),
         diffusion_step_embed_dim=128,
         use_separate_backbone_per_camera=True, # for fair comparison
+        lr=1e-5,
+        lr_backbone=5e-5,
+        weight_decay=1e-4,
+        n_groups=8,
+        use_group_norm=False,
+        use_film_scale_modulation=True,
     ):
         """
         Args:
@@ -75,12 +79,37 @@ class DiffusionPolicy(nn.Module):
         self.use_separate_backbone_per_camera = use_separate_backbone_per_camera,
         
 
-        self.diffusion = DiffusionModel()
+        self.diffusion = DiffusionModel(act_dim=act_dim,
+                                        qpos_dim=qpos_dim,
+                                        img_shape=img_shape,
+                                        n_obs_steps=n_obs_steps,
+                                        n_action_steps=n_action_steps,
+                                        horizon=horizon,
+                                        num_train_timesteps=None,
+                                        num_inference_steps=None,
+                                        drop_n_last_frames=drop_n_last_frames,
+                                        down_dims=down_dims,
+                                        diffusion_step_embed_dim=diffusion_step_embed_dim,
+                                        n_groups=n_groups,
+                                        use_group_norm=use_group_norm,
+                                        use_film_scale_modulation=use_film_scale_modulation,
+                                        n_cameras=n_cameras,
+                                        use_separate_backbone_per_camera=True)
+        
+        param_dicts = [
+                {"params": [p for n, p in self.diffusion.named_parameters() if "backbone" not in n and p.requires_grad]},
+                {
+                    "params": [p for n, p in self.diffusion.named_parameters() if "backbone" in n and p.requires_grad],
+                    "lr": lr_backbone,
+                },
+            ]
+        self.optimizer = torch.optim.AdamW(param_dicts, lr=lr,
+                                    weight_decay=weight_decay)
 
         self.reset()
 
-    def get_optim_params(self) -> dict:
-        return self.diffusion.parameters()
+    def configure_optimizers(self):
+        return self.optimizer
 
     def reset(self):
         """Clear observation and action queues. Should be called on `env.reset()`"""
