@@ -79,6 +79,8 @@ def get_args_parser():
     parser.add_argument('--load_dir', action='store', type=str, help='dir to load checkpoint', required=False, default=None)
     parser.add_argument('--use_distributed', action='store', type=bool, help='whether to use ddp mode', required=False, default=False)
     parser.add_argument('--save_videos', action='store', type=bool, help='whether to save videos in eval', required=False, default=False)
+    parser.add_argument('--eval_after', action='store_true', help='whether to eval after training', required=False, default=False)
+    parser.add_argument('--clip_sample_range', action='store', type=float, help='magnitude at which to clip noise', required=False, default=None)
 
     return parser
 

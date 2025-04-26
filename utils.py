@@ -106,6 +106,10 @@ class EpisodicDataset(torch.utils.data.Dataset):
             qpos_data = qpos_data[:-self.drop_last_frames]
             is_pad = is_pad[:-self.drop_last_frames]'''
 
+        '''print(f"{image_data.min()=}{image_data.max()=}")
+        print(f"{qpos_data.min()=}{qpos_data.max()=}")
+        print(f"{action_data.min()=}{action_data.max()=}")'''
+        #raise ValueError()
         return image_data, qpos_data, action_data, is_pad
 
 

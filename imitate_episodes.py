@@ -127,8 +127,9 @@ def main(args):
         n_obs_steps = 2
         n_act_steps = args['chunk_size'] // 2 #8 # chunk size
         horizon = args['chunk_size'] #16 
-        drop_n_last_timesteps = 7
+        drop_n_last_timesteps = horizon - n_act_steps - n_obs_steps + 1
         diffusion_step_embed_dim = args['hidden_dim'] # default 128
+        clip_sample_range = args['clip_sample_range']
         policy_config = {
             'act_dim': state_dim,  # dimension of pos control space = same dim as pos
             'qpos_dim': state_dim, # dimension of position space
@@ -141,6 +142,7 @@ def main(args):
             'img_shape': None,
             'num_train_timesteps': 100,
             'num_inference_steps': None,
+            'clip_sample_range': clip_sample_range, # actions roughly between + - 3
             # vision model params
             'camera_names': camera_names,
             'lr_backbone': lr_backbone,
@@ -631,16 +633,21 @@ def train_bc(train_dataloader, val_dataloader, config, save_dir, device, is_logg
         progress_bar.set_postfix_str(f"Train: {train_summary_string} | Val: {val_summary_string}")
         #print(summary_string)
 
-        if epoch % 100 == 0 and save_dir is not None:
+        # save checkpoints way less often for memory.
+        # normally i'd parametrize this as part of a training loop
+        if epoch % 500 == 0 and save_dir is not None:
             ckpt_path = os.path.join(save_dir, f'policy_epoch_{epoch}_seed_{seed}.ckpt')
             torch.save(policy.state_dict(), ckpt_path)
             plot_history(train_history, validation_history, epoch, save_dir, seed)
 
+    
     if save_dir is not None:
         ckpt_path = os.path.join(save_dir, f'policy_last.ckpt')
         torch.save(policy.state_dict(), ckpt_path)
 
-        best_epoch, min_val_loss, best_state_dict = best_ckpt_info
+    # save best policy, return best info no matter what
+    best_epoch, min_val_loss, best_state_dict = best_ckpt_info
+    if save_dir is not None:
         ckpt_path = os.path.join(save_dir, f'best_policy_epoch_{best_epoch}_seed_{seed}.ckpt')
         torch.save(best_state_dict, ckpt_path)
     print(f'Training finished:\nSeed {seed}, val loss {min_val_loss:.6f} at epoch {best_epoch}')
@@ -693,7 +700,8 @@ if __name__ == '__main__':
     parser.add_argument('--ckpt_name', action='store', type=str, help='name of checkpoint', required=False, default=None)
     parser.add_argument('--use_distributed', action='store', type=bool, help='whether to use ddp mode', required=False, default=False)
     parser.add_argument('--save_videos', action='store', type=bool, help='whether to save videos in eval', required=False, default=False)
-    parser.add_argument('--eval_after', action='store', type=bool, help='whether to eval after training', required=False, default=False)
+    parser.add_argument('--clip_sample_range', action='store', type=float, help='magnitude at which to clip noise', required=False, default=None)
+    parser.add_argument('--eval_after', action='store_true', help='whether to eval after training', required=False, default=False)
 
     # for ACT
     parser.add_argument('--kl_weight', action='store', type=int, help='KL Weight', required=False)

@@ -35,6 +35,7 @@ class DiffusionPolicy(nn.Module):
         drop_n_last_frames=7,
         num_train_timesteps=100,
         num_inference_steps=None,
+        clip_sample_range=None,
         down_dims=(512,1024,2048),
         diffusion_step_embed_dim=128,
         use_separate_backbone_per_camera=True, # for fair comparison
@@ -81,6 +82,7 @@ class DiffusionPolicy(nn.Module):
                                         horizon=horizon,
                                         num_train_timesteps=num_train_timesteps,
                                         num_inference_steps=num_inference_steps,
+                                        clip_sample_range=clip_sample_range,
                                         drop_n_last_frames=drop_n_last_frames,
                                         down_dims=down_dims,
                                         diffusion_step_embed_dim=diffusion_step_embed_dim,
@@ -189,6 +191,7 @@ class DiffusionModel(nn.Module):
                 horizon=16,
                 num_train_timesteps=100,
                 num_inference_steps=None,
+                clip_sample_range=None,
                 drop_n_last_frames=7,
                 do_mask_loss_for_padding=False,
                 vision_backbone='resnet18',
@@ -253,13 +256,16 @@ class DiffusionModel(nn.Module):
                                                use_film_scale_modulation=use_film_scale_modulation, 
                                                global_cond_dim=global_cond_dim * n_obs_steps)
 
+
+        # if clip sample range provided, clip=True
+        clip_sample = clip_sample_range is not None
         self.noise_scheduler = DDPMScheduler(
             num_train_timesteps=num_train_timesteps,
             beta_start=0.0001,
             beta_end=0.02,
             beta_schedule="squaredcos_cap_v2",
-            clip_sample=True,
-            clip_sample_range=1.0,
+            clip_sample=clip_sample,
+            clip_sample_range=clip_sample_range, # actions unit normal min -2.8 max 2.8 ish
             prediction_type="epsilon",
         )
 
