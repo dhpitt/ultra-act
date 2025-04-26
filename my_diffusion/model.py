@@ -136,31 +136,18 @@ class DiffusionPolicy(nn.Module):
         action = self._action_queue.popleft()
         return action
 
-    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, None]:
+    def forward(self, qpos, images, actions, is_pad) -> tuple[Tensor, None]:
         """Run the batch through the model and compute the loss for training or validation."""
-        batch = self.normalize_inputs(batch)
-        if self.image_features:
-            batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-            batch["observation.images"] = torch.stack(
-                [batch[key] for key in self.image_features], dim=-4
-            )
-        batch = self.normalize_targets(batch)
-        loss = self.diffusion.compute_loss(batch)
-        # no output_dict so returning None
-        return loss, None
-
-
-def _make_noise_scheduler(name: str, **kwargs: dict) -> DDPMScheduler | DDIMScheduler:
-    """
-    Factory for noise scheduler instances of the requested type. All kwargs are passed
-    to the scheduler.
-    """
-    if name == "DDPM":
-        return DDPMScheduler(**kwargs)
-    elif name == "DDIM":
-        return DDIMScheduler(**kwargs)
-    else:
-        raise ValueError(f"Unsupported noise scheduler type {name}")
+        ## Training/val
+        if actions is not None:
+            loss = self.diffusion.compute_loss(qpos, images, actions, is_pad)
+            loss_dict = {'mse': loss, 'loss': loss}
+            # no output_dict so returning None
+            return loss
+        ## inference
+        else:
+            a_hat = self.select_action(qpos, images, actions, is_pad)
+            return a_hat
 
 
 class DiffusionModel(nn.Module):
@@ -238,8 +225,7 @@ class DiffusionModel(nn.Module):
                                                use_film_scale_modulation=use_film_scale_modulation, 
                                                global_cond_dim=global_cond_dim * n_obs_steps)
 
-        self.noise_scheduler = _make_noise_scheduler(
-            "DDPM",
+        self.noise_scheduler = DDPMScheduler(
             num_train_timesteps=num_train_timesteps,
             beta_start=0.0001,
             beta_end=0.02,
