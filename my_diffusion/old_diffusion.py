@@ -1,6 +1,24 @@
-from collections import deque
+#!/usr/bin/env python
 
-from torch import nn
+# Copyright 2024 Columbia Artificial Intelligence, Robotics Lab,
+# and The HuggingFace Inc. team. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Diffusion Policy as per "Diffusion Policy: Visuomotor Policy Learning via Action Diffusion"
+
+TODO(alexander-soare):
+  - Remove reliance on diffusers for DDPMScheduler and LR scheduler.
+"""
 
 import math
 from collections import deque
@@ -14,36 +32,32 @@ import torchvision
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
 from torch import Tensor, nn
-import torchvision.transforms as transforms
 
-class DiffusionPolicy(nn.Module):
+from lerobot.common.constants import OBS_ENV, OBS_ROBOT
+from lerobot.common.policies.diffusion.configuration_diffusion import DiffusionConfig
+from lerobot.common.policies.normalize import Normalize, Unnormalize
+from lerobot.common.policies.pretrained import PreTrainedPolicy
+from lerobot.common.policies.utils import (
+    get_device_from_parameters,
+    get_dtype_from_parameters,
+    get_output_shape,
+    populate_queues,
+)
+
+
+class DiffusionPolicy(PreTrainedPolicy):
     """
     Diffusion Policy as per "Diffusion Policy: Visuomotor Policy Learning via Action Diffusion"
     (paper: https://arxiv.org/abs/2303.04137, code: https://github.com/real-stanford/diffusion_policy).
     """
 
+    config_class = DiffusionConfig
+    name = "diffusion"
 
     def __init__(
         self,
-        act_dim,
-        qpos_dim,
-        img_shape,
-        camera_names,
-        n_obs_steps=2,
-        n_action_steps=8,
-        horizon=16,
-        drop_n_last_frames=7,
-        num_train_timesteps=100,
-        num_inference_steps=None,
-        down_dims=(512,1024,2048),
-        diffusion_step_embed_dim=128,
-        use_separate_backbone_per_camera=True, # for fair comparison
-        lr=1e-5,
-        lr_backbone=5e-5,
-        weight_decay=1e-4,
-        n_groups=8,
-        use_group_norm=False,
-        use_film_scale_modulation=True,
+        config: DiffusionConfig,
+        dataset_stats: dict[str, dict[str, Tensor]] | None = None,
     ):
         """
         Args:
@@ -52,67 +66,41 @@ class DiffusionPolicy(nn.Module):
             dataset_stats: Dataset statistics to be used for normalization. If not passed here, it is expected
                 that they will be passed with a call to `load_state_dict` before the policy is used.
         """
-        super().__init__()
-        
-        # queues are populated during rollout of the policy, 
-        # they contain the n latest observations and actions
-        self._qpos_queue = None
-        self._action_queue = None
-        self._image_queue = None
-        
-        self.act_dim = act_dim
-        self.qpos_dim = qpos_dim
-        self.img_shape = img_shape
-        self.camera_names = camera_names
-        self.n_obs_steps = n_obs_steps
-        self.n_action_steps = n_action_steps
-        self.horizon = horizon
-        self.drop_n_last_frames = drop_n_last_frames
-        self.down_dims = down_dims
-        self.diffusion_step_embed_dim = diffusion_step_embed_dim
-        self.use_separate_backbone_per_camera = use_separate_backbone_per_camera
-        
+        super().__init__(config)
+        config.validate_features()
+        self.config = config
 
-        self.diffusion = DiffusionModel(act_dim=act_dim,
-                                        qpos_dim=qpos_dim,
-                                        img_shape=img_shape,
-                                        n_obs_steps=n_obs_steps,
-                                        n_action_steps=n_action_steps,
-                                        horizon=horizon,
-                                        num_train_timesteps=num_train_timesteps,
-                                        num_inference_steps=num_inference_steps,
-                                        drop_n_last_frames=drop_n_last_frames,
-                                        down_dims=down_dims,
-                                        diffusion_step_embed_dim=diffusion_step_embed_dim,
-                                        n_groups=n_groups,
-                                        use_group_norm=use_group_norm,
-                                        use_film_scale_modulation=use_film_scale_modulation,
-                                        camera_names=camera_names,
-                                        use_separate_backbone_per_camera=True)
-        
-        param_dicts = [
-                {"params": [p for n, p in self.diffusion.named_parameters() if "backbone" not in n and p.requires_grad]},
-                {
-                    "params": [p for n, p in self.diffusion.named_parameters() if "backbone" in n and p.requires_grad],
-                    "lr": lr_backbone,
-                },
-            ]
-        self.optimizer = torch.optim.AdamW(param_dicts, lr=lr,
-                                    weight_decay=weight_decay)
+        self.normalize_inputs = Normalize(config.input_features, config.normalization_mapping, dataset_stats)
+        self.normalize_targets = Normalize(
+            config.output_features, config.normalization_mapping, dataset_stats
+        )
+        self.unnormalize_outputs = Unnormalize(
+            config.output_features, config.normalization_mapping, dataset_stats
+        )
+
+        # queues are populated during rollout of the policy, they contain the n latest observations and actions
+        self._queues = None
+
+        self.diffusion = DiffusionModel(config)
 
         self.reset()
 
-    def configure_optimizers(self):
-        return self.optimizer
+    def get_optim_params(self) -> dict:
+        return self.diffusion.parameters()
 
     def reset(self):
         """Clear observation and action queues. Should be called on `env.reset()`"""
-        self._qpos_queue = deque(maxlen=self.n_obs_steps)
-        self._action_queue = deque(maxlen=self.n_action_steps)
-        self._image_queue = deque(maxlen=self.n_obs_steps)
+        self._queues = {
+            "observation.state": deque(maxlen=self.config.n_obs_steps),
+            "action": deque(maxlen=self.config.n_action_steps),
+        }
+        if self.config.image_features:
+            self._queues["observation.images"] = deque(maxlen=self.config.n_obs_steps)
+        if self.config.env_state_feature:
+            self._queues["observation.environment_state"] = deque(maxlen=self.config.n_obs_steps)
 
     @torch.no_grad
-    def select_action(self, qpos, images, actions=None, is_pad=None) -> Tensor:
+    def select_action(self, batch: dict[str, Tensor]) -> Tensor:
         """Select a single action given environment observations.
 
         This method handles caching a history of observations and an action trajectory generated by the
@@ -133,136 +121,91 @@ class DiffusionPolicy(nn.Module):
         "horizon" may not the best name to describe what the variable actually means, because this period is
         actually measured from the first observation which (if `n_obs_steps` > 1) happened in the past.
         """
-        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                         std=[0.229, 0.224, 0.225])
-        images = normalize(images)
-
-        
-        if self.image_features:
+        batch = self.normalize_inputs(batch)
+        if self.config.image_features:
             batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
             batch["observation.images"] = torch.stack(
-                [batch[key] for key in self.image_features], dim=-4
+                [batch[key] for key in self.config.image_features], dim=-4
             )
         # Note: It's important that this happens after stacking the images into a single key.
-        if actions is not None:
-            self._action_queue = populate_single_queue(self._action_queue, actions)
-        self._obs_queue = populate_single_queue(self._obs_queue)
-        self._image_queue = populate_single_queue(self._image_queue)
-        
-        if len(self._action_queue) == 0:
+        self._queues = populate_queues(self._queues, batch)
+
+        if len(self._queues["action"]) == 0:
             # stack n latest observations from the queue
             batch = {k: torch.stack(list(self._queues[k]), dim=1) for k in batch if k in self._queues}
-            a_hat = self.diffusion.generate_actions(batch)
+            actions = self.diffusion.generate_actions(batch)
 
-            self._action_queue.extend(a_hat.transpose(0, 1))
+            # TODO(rcadene): make above methods return output dictionary?
+            actions = self.unnormalize_outputs({"action": actions})["action"]
 
-        action = self._action_queue.popleft()
+            self._queues["action"].extend(actions.transpose(0, 1))
+
+        action = self._queues["action"].popleft()
         return action
 
-    def forward(self, qpos, images, actions, is_pad) -> tuple[Tensor, None]:
+    def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, None]:
         """Run the batch through the model and compute the loss for training or validation."""
-        ## Training/val
-        if actions is not None:
-            loss = self.diffusion.compute_loss(qpos, images, actions, is_pad)
-            loss_dict = {'mse': loss, 'loss': loss}
-            # no output_dict so returning None
-            return loss
-        ## inference
-        else:
-            a_hat = self.select_action(qpos, images, actions, is_pad)
-            return a_hat
+        batch = self.normalize_inputs(batch)
+        if self.config.image_features:
+            batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
+            batch["observation.images"] = torch.stack(
+                [batch[key] for key in self.config.image_features], dim=-4
+            )
+        batch = self.normalize_targets(batch)
+        loss = self.diffusion.compute_loss(batch)
+        # no output_dict so returning None
+        return loss, None
+
+
+def _make_noise_scheduler(name: str, **kwargs: dict) -> DDPMScheduler | DDIMScheduler:
+    """
+    Factory for noise scheduler instances of the requested type. All kwargs are passed
+    to the scheduler.
+    """
+    if name == "DDPM":
+        return DDPMScheduler(**kwargs)
+    elif name == "DDIM":
+        return DDIMScheduler(**kwargs)
+    else:
+        raise ValueError(f"Unsupported noise scheduler type {name}")
 
 
 class DiffusionModel(nn.Module):
-    def __init__(self, 
-                act_dim,
-                qpos_dim,
-                img_shape,
-                camera_names,
-                n_obs_steps=2,
-                n_action_steps=8,
-                horizon=16,
-                num_train_timesteps=100,
-                num_inference_steps=None,
-                drop_n_last_frames=7,
-                do_mask_loss_for_padding=False,
-                vision_backbone='resnet18',
-                pretrained_backbone_weights=None,
-                spatial_softmax_keypoints=32,
-                use_group_norm=False,
-                crop_shape=None,
-                crop_random=False,
-                down_dims=(512,1024,2048),
-                diffusion_step_embed_dim=128,
-                n_groups=8,
-                kernel_size=5,
-                use_film_scale_modulation=True, 
-                use_separate_backbone_per_camera=True, # for fair comparison
-                 ):
+    def __init__(self, config: DiffusionConfig):
         super().__init__()
-
-        self.act_dim=act_dim
-        self.qpos_dim=qpos_dim
-        self.qpos_dim=qpos_dim
-        self.img_shape=img_shape
-        self.camera_names=camera_names
-        self.n_obs_steps=n_obs_steps
-        self.n_action_steps=n_action_steps
-        self.horizon=horizon
-        self.drop_n_last_frames = drop_n_last_frames
+        self.config = config
 
         # Build observation encoders (depending on which observations are provided).
-        global_cond_dim = qpos_dim
-        self.use_separate_backbone_per_camera = use_separate_backbone_per_camera
-        num_images = len(self.camera_names)
-        if self.use_separate_backbone_per_camera:
-            encoders = [
-                DiffusionRgbEncoder(vision_backbone=vision_backbone,
-                                    image_shape=img_shape,
-                                    spatial_softmax_num_keypoints=spatial_softmax_keypoints,
-                                    use_group_norm=use_group_norm,
-                                    crop_is_random=crop_random,
-                                    crop_shape=crop_shape,
-                                    pretrained_weights=pretrained_backbone_weights
-                                    ) for _ in range(num_images)
-                                    ]
-            self.backbone = nn.ModuleList(encoders)
-            global_cond_dim += encoders[0].feature_dim * num_images
-        else:
-            self.backbone = DiffusionRgbEncoder(vision_backbone=vision_backbone,
-                                    image_shape=img_shape,
-                                    spatial_softmax_num_keypoints=spatial_softmax_keypoints,
-                                    use_group_norm=use_group_norm,
-                                    crop_is_random=crop_random,
-                                    crop_shape=crop_shape,
-                                    pretrained_weights=pretrained_backbone_weights
-                                    )
-            global_cond_dim += self.backbone.feature_dim * num_images
+        global_cond_dim = self.config.robot_state_feature.shape[0]
+        if self.config.image_features:
+            num_images = len(self.config.image_features)
+            if self.config.use_separate_rgb_encoder_per_camera:
+                encoders = [DiffusionRgbEncoder(config) for _ in range(num_images)]
+                self.rgb_encoder = nn.ModuleList(encoders)
+                global_cond_dim += encoders[0].feature_dim * num_images
+            else:
+                self.rgb_encoder = DiffusionRgbEncoder(config)
+                global_cond_dim += self.rgb_encoder.feature_dim * num_images
+        if self.config.env_state_feature:
+            global_cond_dim += self.config.env_state_feature.shape[0]
 
-        self.unet = DiffusionConditionalUnet1d(diffusion_step_embed_dim=diffusion_step_embed_dim,
-                                               act_dim=act_dim,
-                                               down_dims=down_dims,
-                                               n_groups=n_groups,
-                                               kernel_size=kernel_size,
-                                               use_film_scale_modulation=use_film_scale_modulation, 
-                                               global_cond_dim=global_cond_dim * n_obs_steps)
+        self.unet = DiffusionConditionalUnet1d(config, global_cond_dim=global_cond_dim * config.n_obs_steps)
 
-        self.noise_scheduler = DDPMScheduler(
-            num_train_timesteps=num_train_timesteps,
-            beta_start=0.0001,
-            beta_end=0.02,
-            beta_schedule="squaredcos_cap_v2",
-            clip_sample=True,
-            clip_sample_range=1.0,
-            prediction_type="epsilon",
+        self.noise_scheduler = _make_noise_scheduler(
+            config.noise_scheduler_type,
+            num_train_timesteps=config.num_train_timesteps,
+            beta_start=config.beta_start,
+            beta_end=config.beta_end,
+            beta_schedule=config.beta_schedule,
+            clip_sample=config.clip_sample,
+            clip_sample_range=config.clip_sample_range,
+            prediction_type=config.prediction_type,
         )
 
-        if num_inference_steps is None:
-            self.num_inference_steps = num_train_timesteps
+        if config.num_inference_steps is None:
+            self.num_inference_steps = self.noise_scheduler.config.num_train_timesteps
         else:
-            self.num_inference_steps = num_inference_steps
-
-        self.do_mask_loss_for_padding = do_mask_loss_for_padding
+            self.num_inference_steps = config.num_inference_steps
 
     # ========= inference  ============
     def conditional_sample(
@@ -273,7 +216,7 @@ class DiffusionModel(nn.Module):
 
         # Sample prior.
         sample = torch.randn(
-            size=(batch_size, self.horizon, self.action_feature.shape[0]),
+            size=(batch_size, self.config.horizon, self.config.action_feature.shape[0]),
             dtype=dtype,
             device=device,
             generator=generator,
@@ -293,43 +236,45 @@ class DiffusionModel(nn.Module):
 
         return sample
 
-    def _prepare_global_conditioning(self, qpos, images) -> Tensor:
+    def _prepare_global_conditioning(self, batch: dict[str, Tensor]) -> Tensor:
         """Encode image features and concatenate them all together along with the state vector."""
-        batch_size, n_obs_steps = qpos.shape[:2]
-        global_cond_feats = [qpos]
-        print(f"{images.shape=}")
+        batch_size, n_obs_steps = batch[OBS_ROBOT].shape[:2]
+        global_cond_feats = [batch[OBS_ROBOT]]
         # Extract image features.
-        if self.use_separate_backbone_per_camera:
-            # images come in b, n_cameras, c, h, w == one image per action
+        if self.config.image_features:
+            if self.config.use_separate_rgb_encoder_per_camera:
+                # Combine batch and sequence dims while rearranging to make the camera index dimension first.
+                images_per_camera = einops.rearrange(batch["observation.images"], "b s n ... -> n (b s) ...")
+                img_features_list = torch.cat(
+                    [
+                        encoder(images)
+                        for encoder, images in zip(self.rgb_encoder, images_per_camera, strict=True)
+                    ]
+                )
+                # Separate batch and sequence dims back out. The camera index dim gets absorbed into the
+                # feature dim (effectively concatenating the camera features).
+                img_features = einops.rearrange(
+                    img_features_list, "(n b s) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
+                )
+            else:
+                # Combine batch, sequence, and "which camera" dims before passing to shared encoder.
+                img_features = self.rgb_encoder(
+                    einops.rearrange(batch["observation.images"], "b s n ... -> (b s n) ...")
+                )
+                # Separate batch dim and sequence dim back out. The camera index dim gets absorbed into the
+                # feature dim (effectively concatenating the camera features).
+                img_features = einops.rearrange(
+                    img_features, "(b s n) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
+                )
+            global_cond_feats.append(img_features)
 
-            # Combine batch and sequence dims while rearranging to make the camera index dimension first.
-            img_features = []
-            for i, backbone in enumerate(self.backbone):
-                img_features.append(backbone(images[:, i])) # grab the n-th camera's images
-            img_features = torch.cat(img_features,dim=0) # n, b, (shape)
-            # Separate batch and sequence dims back out. The camera index dim gets absorbed into the
-            # feature dim (effectively concatenating the camera features).
-            img_features = einops.rearrange(
-                img_features, "(n b) ... -> b s (n ...)", b=batch_size,s=1
-            ).repeat(1, n_obs_steps, 1) # in diffusion policy we have 1 img per obs step. Repeat to match ACT
-        else:
-            raise NotImplementedError()
-            '''# Combine batch, sequence, and "which camera" dims before passing to shared encoder.
-            img_features = self.backbone(
-                einops.rearrange(batch["observation.images"], "b s n ... -> (b s n) ...")
-            )
-            # Separate batch dim and sequence dim back out. The camera index dim gets absorbed into the
-            # feature dim (effectively concatenating the camera features).
-            img_features = einops.rearrange(
-                img_features, "(b s n) ... -> b s (n ...)", b=batch_size, s=n_obs_steps
-            )'''
-        global_cond_feats.append(img_features)
-
+        if self.config.env_state_feature:
+            global_cond_feats.append(batch[OBS_ENV])
 
         # Concatenate features then flatten to (B, global_cond_dim).
         return torch.cat(global_cond_feats, dim=-1).flatten(start_dim=1)
 
-    def generate_actions(self, qpos, images) -> Tensor:
+    def generate_actions(self, batch: dict[str, Tensor]) -> Tensor:
         """
         This function expects `batch` to have:
         {
@@ -340,23 +285,23 @@ class DiffusionModel(nn.Module):
             "observation.environment_state": (B, environment_dim)
         }
         """
-        batch_size, n_obs_steps = qpos
-        assert n_obs_steps == self.n_obs_steps
+        batch_size, n_obs_steps = batch["observation.state"].shape[:2]
+        assert n_obs_steps == self.config.n_obs_steps
 
         # Encode image features and concatenate them all together along with the state vector.
-        global_cond = self._prepare_global_conditioning(qpos, images)  # (B, global_cond_dim)
+        global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
 
         # run sampling
         actions = self.conditional_sample(batch_size, global_cond=global_cond)
 
         # Extract `n_action_steps` steps worth of actions (from the current observation).
         start = n_obs_steps - 1
-        end = start + self.n_action_steps
+        end = start + self.config.n_action_steps
         actions = actions[:, start:end]
 
         return actions
 
-    def compute_loss(self, qpos, images, action, is_pad) -> Tensor:
+    def compute_loss(self, batch: dict[str, Tensor]) -> Tensor:
         """
         This function expects `batch` to have (at least):
         {
@@ -371,19 +316,18 @@ class DiffusionModel(nn.Module):
         }
         """
         # Input validation.
-        n_obs_steps = qpos.shape[1]
-        horizon = action.shape[1]
-        print(f"{qpos.shape=}")
-        print(f"{images.shape=}")
-        print(f"{action.shape=}")
-        assert horizon == self.horizon
-        assert n_obs_steps == self.n_obs_steps
+        assert set(batch).issuperset({"observation.state", "action", "action_is_pad"})
+        assert "observation.images" in batch or "observation.environment_state" in batch
+        n_obs_steps = batch["observation.state"].shape[1]
+        horizon = batch["action"].shape[1]
+        assert horizon == self.config.horizon
+        assert n_obs_steps == self.config.n_obs_steps
 
         # Encode image features and concatenate them all together along with the state vector.
-        global_cond = self._prepare_global_conditioning(qpos, images)  # (B, global_cond_dim)
+        global_cond = self._prepare_global_conditioning(batch)  # (B, global_cond_dim)
 
         # Forward diffusion.
-        trajectory = action
+        trajectory = batch["action"]
         # Sample noise to add to the trajectory.
         eps = torch.randn(trajectory.shape, device=trajectory.device)
         # Sample a random noising timestep for each item in the batch.
@@ -401,23 +345,23 @@ class DiffusionModel(nn.Module):
 
         # Compute the loss.
         # The target is either the original trajectory, or the noise.
-        if self.prediction_type == "epsilon":
+        if self.config.prediction_type == "epsilon":
             target = eps
-        elif self.prediction_type == "sample":
-            target = action
+        elif self.config.prediction_type == "sample":
+            target = batch["action"]
         else:
-            raise ValueError(f"Unsupported prediction type {self.prediction_type}")
+            raise ValueError(f"Unsupported prediction type {self.config.prediction_type}")
 
         loss = F.mse_loss(pred, target, reduction="none")
 
         # Mask loss wherever the action is padded with copies (edges of the dataset trajectory).
-        if self.do_mask_loss_for_padding:
-            if is_pad is None:
+        if self.config.do_mask_loss_for_padding:
+            if "action_is_pad" not in batch:
                 raise ValueError(
                     "You need to provide 'action_is_pad' in the batch when "
-                    f"{self.do_mask_loss_for_padding=}."
+                    f"{self.config.do_mask_loss_for_padding=}."
                 )
-            in_episode_bound = ~is_pad
+            in_episode_bound = ~batch["action_is_pad"]
             loss = loss * in_episode_bound.unsqueeze(-1)
 
         return loss.mean()
@@ -500,35 +444,29 @@ class DiffusionRgbEncoder(nn.Module):
     Includes the ability to normalize and crop the image first.
     """
 
-    def __init__(self, vision_backbone='resnet18', 
-                 image_shape=(3,480,640),
-                 spatial_softmax_num_keypoints=32,
-                 use_group_norm=False,
-                 crop_shape=None, 
-                 crop_is_random=None, 
-                 pretrained_weights=None):
+    def __init__(self, config: DiffusionConfig):
         super().__init__()
         # Set up optional preprocessing.
-        if crop_shape is not None:
+        if config.crop_shape is not None:
             self.do_crop = True
             # Always use center crop for eval
-            self.center_crop = torchvision.transforms.CenterCrop(crop_shape)
-            if crop_is_random:
-                self.maybe_random_crop = torchvision.transforms.RandomCrop(crop_shape)
+            self.center_crop = torchvision.transforms.CenterCrop(config.crop_shape)
+            if config.crop_is_random:
+                self.maybe_random_crop = torchvision.transforms.RandomCrop(config.crop_shape)
             else:
                 self.maybe_random_crop = self.center_crop
         else:
             self.do_crop = False
 
         # Set up backbone.
-        backbone_model = getattr(torchvision.models, vision_backbone)(
-            weights=pretrained_weights
+        backbone_model = getattr(torchvision.models, config.vision_backbone)(
+            weights=config.pretrained_backbone_weights
         )
         # Note: This assumes that the layer4 feature map is children()[-3]
         # TODO(alexander-soare): Use a safer alternative.
         self.backbone = nn.Sequential(*(list(backbone_model.children())[:-2]))
-        if use_group_norm:
-            if pretrained_weights:
+        if config.use_group_norm:
+            if config.pretrained_backbone_weights:
                 raise ValueError(
                     "You can't replace BatchNorm in a pretrained model without ruining the weights!"
                 )
@@ -545,14 +483,14 @@ class DiffusionRgbEncoder(nn.Module):
         # height and width from `config.image_features`.
 
         # Note: we have a check in the config class to make sure all images have the same shape.
-        
-        dummy_shape_h_w = crop_shape if crop_shape is not None else image_shape[2:] # h w
-        dummy_shape = (1, image_shape[1], *dummy_shape_h_w)
+        images_shape = next(iter(config.image_features.values())).shape
+        dummy_shape_h_w = config.crop_shape if config.crop_shape is not None else images_shape[1:]
+        dummy_shape = (1, images_shape[0], *dummy_shape_h_w)
         feature_map_shape = get_output_shape(self.backbone, dummy_shape)[1:]
 
-        self.pool = SpatialSoftmax(feature_map_shape, num_kp=spatial_softmax_num_keypoints)
-        self.feature_dim = spatial_softmax_num_keypoints * 2
-        self.out = nn.Linear(spatial_softmax_num_keypoints * 2, self.feature_dim)
+        self.pool = SpatialSoftmax(feature_map_shape, num_kp=config.spatial_softmax_num_keypoints)
+        self.feature_dim = config.spatial_softmax_num_keypoints * 2
+        self.out = nn.Linear(config.spatial_softmax_num_keypoints * 2, self.feature_dim)
         self.relu = nn.ReLU()
 
     def forward(self, x: Tensor) -> Tensor:
@@ -648,40 +586,34 @@ class DiffusionConditionalUnet1d(nn.Module):
     Note: this removes local conditioning as compared to the original diffusion policy code.
     """
 
-    def __init__(self, 
-                 diffusion_step_embed_dim,
-                 act_dim,
-                 down_dims,
-                 kernel_size,
-                 n_groups,
-                 use_film_scale_modulation,
-                 global_cond_dim: int):
+    def __init__(self, config: DiffusionConfig, global_cond_dim: int):
         super().__init__()
+
+        self.config = config
 
         # Encoder for the diffusion timestep.
         self.diffusion_step_encoder = nn.Sequential(
-            DiffusionSinusoidalPosEmb(diffusion_step_embed_dim),
-            nn.Linear(diffusion_step_embed_dim, diffusion_step_embed_dim * 4),
+            DiffusionSinusoidalPosEmb(config.diffusion_step_embed_dim),
+            nn.Linear(config.diffusion_step_embed_dim, config.diffusion_step_embed_dim * 4),
             nn.Mish(),
-            nn.Linear(diffusion_step_embed_dim * 4, diffusion_step_embed_dim),
+            nn.Linear(config.diffusion_step_embed_dim * 4, config.diffusion_step_embed_dim),
         )
 
         # The FiLM conditioning dimension.
-        cond_dim = diffusion_step_embed_dim + global_cond_dim
+        cond_dim = config.diffusion_step_embed_dim + global_cond_dim
 
         # In channels / out channels for each downsampling block in the Unet's encoder. For the decoder, we
         # just reverse these.
-        # act_dim replaced action_feature.shape[0]
-        in_out = [(act_dim, down_dims[0])] + list(
-            zip(down_dims[:-1], down_dims[1:], strict=True)
+        in_out = [(config.action_feature.shape[0], config.down_dims[0])] + list(
+            zip(config.down_dims[:-1], config.down_dims[1:], strict=True)
         )
 
         # Unet encoder.
         common_res_block_kwargs = {
             "cond_dim": cond_dim,
-            "kernel_size": kernel_size,
-            "n_groups": n_groups,
-            "use_film_scale_modulation": use_film_scale_modulation,
+            "kernel_size": config.kernel_size,
+            "n_groups": config.n_groups,
+            "use_film_scale_modulation": config.use_film_scale_modulation,
         }
         self.down_modules = nn.ModuleList([])
         for ind, (dim_in, dim_out) in enumerate(in_out):
@@ -701,10 +633,10 @@ class DiffusionConditionalUnet1d(nn.Module):
         self.mid_modules = nn.ModuleList(
             [
                 DiffusionConditionalResidualBlock1d(
-                    down_dims[-1], down_dims[-1], **common_res_block_kwargs
+                    config.down_dims[-1], config.down_dims[-1], **common_res_block_kwargs
                 ),
                 DiffusionConditionalResidualBlock1d(
-                    down_dims[-1], down_dims[-1], **common_res_block_kwargs
+                    config.down_dims[-1], config.down_dims[-1], **common_res_block_kwargs
                 ),
             ]
         )
@@ -726,8 +658,8 @@ class DiffusionConditionalUnet1d(nn.Module):
             )
 
         self.final_conv = nn.Sequential(
-            DiffusionConv1dBlock(down_dims[0], down_dims[0], kernel_size=kernel_size),
-            nn.Conv1d(down_dims[0], act_dim, 1),
+            DiffusionConv1dBlock(config.down_dims[0], config.down_dims[0], kernel_size=config.kernel_size),
+            nn.Conv1d(config.down_dims[0], config.action_feature.shape[0], 1),
         )
 
     def forward(self, x: Tensor, timestep: Tensor | int, global_cond=None) -> Tensor:
@@ -831,49 +763,3 @@ class DiffusionConditionalResidualBlock1d(nn.Module):
         out = self.conv2(out)
         out = out + self.residual_conv(x)
         return out
-    
-
-### stolen lerobot utils
-
-def populate_single_queue(queue, elem):
-    if len(queue) != queue.maxlen:
-        # initialize by copying the first observation several times until the queue is full
-        while len(queue) != queue.maxlen:
-            queue.append(elem)
-    else:
-        # add latest observation to the queue
-        queue.append(elem)
-    return queue
-
-
-def get_device_from_parameters(module: nn.Module) -> torch.device:
-    """Get a module's device by checking one of its parameters.
-
-    Note: assumes that all parameters have the same device
-    """
-    return next(iter(module.parameters())).device
-
-
-def get_dtype_from_parameters(module: nn.Module) -> torch.dtype:
-    """Get a module's parameter dtype by checking one of its parameters.
-
-    Note: assumes that all parameters have the same dtype.
-    """
-    return next(iter(module.parameters())).dtype
-
-
-def get_output_shape(module: nn.Module, input_shape: tuple) -> tuple:
-    """
-    Calculates the output shape of a PyTorch module given an input shape.
-
-    Args:
-        module (nn.Module): a PyTorch module
-        input_shape (tuple): A tuple representing the input shape, e.g., (batch_size, channels, height, width)
-
-    Returns:
-        tuple: The output shape of the module.
-    """
-    dummy_input = torch.zeros(size=input_shape)
-    with torch.inference_mode():
-        output = module(dummy_input)
-    return tuple(output.shape)

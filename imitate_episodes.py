@@ -123,8 +123,8 @@ def main(args):
     elif policy_class == 'Diffusion':
         down_dims = [args['dim_feedforward'] * (2**k) for k in range(3)]
         n_obs_steps = 2
-        n_act_steps = 8 # chunk size
-        horizon = 16
+        n_act_steps = args['chunk_size'] // 2 #8 # chunk size
+        horizon = args['chunk_size'] #16 
         drop_n_last_timesteps = 7
         diffusion_step_embed_dim = args['hidden_dim'] # default 128
         policy_config = {
@@ -133,10 +133,12 @@ def main(args):
             'n_obs_steps': n_obs_steps, # number of input obs steps
             'n_action_steps': n_act_steps, # number of steps to actually use
             'horizon': horizon, # number of steps to predict args['chunk_dim']?
-            'drop_n_last_timesteps': drop_n_last_timesteps,
+            'drop_n_last_frames': drop_n_last_timesteps,
             'diffusion_step_embed_dim': diffusion_step_embed_dim,
             'down_dims': down_dims, # downsample
-
+            'img_shape': None,
+            'num_train_timesteps': 100,
+            'num_inference_steps': None,
             # vision model params
             'camera_names': camera_names,
             'lr_backbone': lr_backbone,
@@ -147,7 +149,7 @@ def main(args):
 
             # basic opt
             'lr': args['lr'],
-            'weight_decay': args['weight_decay'],
+            'weight_decay': 1e-4,
             }
         
         '''
@@ -239,7 +241,7 @@ def main(args):
     train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val,
                                                            drop_last_frames=policy_config.get('drop_n_last_frames', None))
     if config['policy_class'] == "Diffusion":
-        config['policy_config']['stats'] = stats
+        config['policy_config']['img_shape'] = stats['ds_meta']['observation.image']
     # Use distributed sampling to avoid reusing examples in DDP mode
     if use_distributed and dist.is_initialized():
         train_db = train_dataloader.dataset
@@ -296,6 +298,8 @@ def make_optimizer(policy_class, policy):
     if policy_class == 'ACT':
         optimizer = policy.configure_optimizers()
     elif policy_class == 'CNNMLP':
+        optimizer = policy.configure_optimizers()
+    elif policy_class == 'Diffusion':
         optimizer = policy.configure_optimizers()
     else:
         raise NotImplementedError
