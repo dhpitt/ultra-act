@@ -39,13 +39,13 @@ class DiffusionPolicy(nn.Module):
         qpos_dim,
         img_shape,
         n_cameras,
-        n_obs_steps=7,
-        n_action_steps=2,
+        n_obs_steps=2,
+        n_action_steps=8,
         horizon=16,
-        drop_n_last_frames=1,
+        drop_n_last_frames=7,
         down_dims=(512,1024,2048),
         diffusion_step_embed_dim=128,
-        use_separate_rgb_encoder_per_camera=True, # for fair comparison
+        use_separate_backbone_per_camera=True, # for fair comparison
     ):
         """
         Args:
@@ -72,7 +72,7 @@ class DiffusionPolicy(nn.Module):
         self.drop_n_last_frames = drop_n_last_frames,
         self.down_dims = down_dims,
         self.diffusion_step_embed_dim = diffusion_step_embed_dim,
-        self.use_separate_rgb_encoder_per_camera = use_separate_rgb_encoder_per_camera,
+        self.use_separate_backbone_per_camera = use_separate_backbone_per_camera,
         
 
         self.diffusion = DiffusionModel()
@@ -169,12 +169,12 @@ class DiffusionModel(nn.Module):
                 qpos_dim,
                 img_shape,
                 n_cameras,
-                n_obs_steps=7,
-                n_action_steps=2,
+                n_obs_steps=2,
+                n_action_steps=8,
                 horizon=16,
                 num_train_timesteps=100,
                 num_inference_steps=None,
-                drop_n_last_frames=1,
+                drop_n_last_frames=7,
                 do_mask_loss_for_padding=False,
                 vision_backbone='resnet18',
                 pretrained_backbone_weights=None,
@@ -187,16 +187,26 @@ class DiffusionModel(nn.Module):
                 n_groups=8,
                 kernel_size=5,
                 use_film_scale_modulation=True, 
-                use_separate_rgb_encoder_per_camera=True, # for fair comparison
+                use_separate_backbone_per_camera=True, # for fair comparison
                  ):
         super().__init__()
 
+        self.act_dim=act_dim
+        self.qpos_dim=qpos_dim
+        self.qpos_dim=qpos_dim
+        self.img_shape=img_shape
+        self.n_cameras=n_cameras
+        self.n_obs_steps=n_obs_steps
+        self.n_action_steps=n_action_steps
+        self.horizon=horizon
+        self.drop_n_last_frames = drop_n_last_frames
+
         # Build observation encoders (depending on which observations are provided).
         global_cond_dim = qpos_dim
-        self.use_separate_rgb_encoder_per_camera = use_separate_rgb_encoder_per_camera
+        self.use_separate_backbone_per_camera = use_separate_backbone_per_camera
         if self.image_features:
             num_images = len(self.image_features)
-            if self.use_separate_rgb_encoder_per_camera:
+            if self.use_separate_backbone_per_camera:
                 encoders = [
                     DiffusionRgbEncoder(vision_backbone=vision_backbone,
                                         image_shape=img_shape,
@@ -207,10 +217,10 @@ class DiffusionModel(nn.Module):
                                         pretrained_weights=pretrained_backbone_weights
                                         ) for _ in range(num_images)
                                         ]
-                self.rgb_encoder = nn.ModuleList(encoders)
+                self.backbone = nn.ModuleList(encoders)
                 global_cond_dim += encoders[0].feature_dim * num_images
             else:
-                self.rgb_encoder = DiffusionRgbEncoder(vision_backbone=vision_backbone,
+                self.backbone = DiffusionRgbEncoder(vision_backbone=vision_backbone,
                                         image_shape=img_shape,
                                         spatial_softmax_num_keypoints=spatial_softmax_keypoints,
                                         use_group_norm=use_group_norm,
@@ -218,7 +228,7 @@ class DiffusionModel(nn.Module):
                                         crop_shape=crop_shape,
                                         pretrained_weights=pretrained_backbone_weights
                                         )
-                global_cond_dim += self.rgb_encoder.feature_dim * num_images
+                global_cond_dim += self.backbone.feature_dim * num_images
 
         self.unet = DiffusionConditionalUnet1d(diffusion_step_embed_dim=diffusion_step_embed_dim,
                                                act_dim=act_dim,
@@ -280,12 +290,12 @@ class DiffusionModel(nn.Module):
         batch_size, n_obs_steps = qpos.shape[:2]
         global_cond_feats = [qpos]
         # Extract image features.
-        if self.use_separate_rgb_encoder_per_camera:
+        if self.use_separate_backbone_per_camera:
             # images come in b, n_cameras, c, h, w == one image per action
 
             # Combine batch and sequence dims while rearranging to make the camera index dimension first.
             img_features = []
-            for i, backbone in enumerate(self.rgb_encoder):
+            for i, backbone in enumerate(self.backbone):
                 img_features.append(backbone(images[:, i])) # grab the n-th camera's images
             img_features = torch.cat(img_features,dim=0) # n, b, (shape)
             # Separate batch and sequence dims back out. The camera index dim gets absorbed into the
@@ -296,7 +306,7 @@ class DiffusionModel(nn.Module):
         else:
             raise NotImplementedError()
             '''# Combine batch, sequence, and "which camera" dims before passing to shared encoder.
-            img_features = self.rgb_encoder(
+            img_features = self.backbone(
                 einops.rearrange(batch["observation.images"], "b s n ... -> (b s n) ...")
             )
             # Separate batch dim and sequence dim back out. The camera index dim gets absorbed into the
