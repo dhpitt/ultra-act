@@ -8,13 +8,14 @@ import IPython
 e = IPython.embed
 
 class EpisodicDataset(torch.utils.data.Dataset):
-    def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats):
+    def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats, drop_last_frames=None):
         super(EpisodicDataset).__init__()
         self.episode_ids = episode_ids
         self.dataset_dir = dataset_dir
         self.camera_names = camera_names
         self.norm_stats = norm_stats
         self.is_sim = None
+        self.drop_last_frames = drop_last_frames
         self.__getitem__(0) # initialize self.is_sim
 
     def __len__(self):
@@ -73,6 +74,11 @@ class EpisodicDataset(torch.utils.data.Dataset):
         action_data = (action_data - self.norm_stats["action_mean"]) / self.norm_stats["action_std"]
         qpos_data = (qpos_data - self.norm_stats["qpos_mean"]) / self.norm_stats["qpos_std"]
 
+        if self.drop_last_frames is not None:
+            action_data = action_data[:-self.drop_last_frames]
+            qpos_data = qpos_data[:-self.drop_last_frames]
+            is_pad = is_pad[:-self.drop_last_frames]
+
         return image_data, qpos_data, action_data, is_pad
 
 
@@ -108,7 +114,7 @@ def get_norm_stats(dataset_dir, num_episodes):
     return stats
 
 
-def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val):
+def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val, drop_last_frames):
     print(f'\nData from: {dataset_dir}\n')
     # obtain train test split
     train_ratio = 0.8
@@ -120,8 +126,15 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
     norm_stats = get_norm_stats(dataset_dir, num_episodes)
 
     # construct dataset and dataloader
-    train_dataset = EpisodicDataset(train_indices, dataset_dir, camera_names, norm_stats)
-    val_dataset = EpisodicDataset(val_indices, dataset_dir, camera_names, norm_stats)
+    train_dataset = EpisodicDataset(train_indices, dataset_dir, camera_names, norm_stats, drop_last_frames=drop_last_frames)
+    images, obs, action, _ = train_dataset[0]
+    # store shapes of one batch for constructing diffusionpolicy
+    norm_stats["ds_meta"] = {
+        "observation.image": images.shape,
+        "observation.state": obs.shape,
+        "action": action.shape
+    },
+    val_dataset = EpisodicDataset(val_indices, dataset_dir, camera_names, norm_stats, drop_last_frames=drop_last_frames)
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size_train, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size_val, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)
 
