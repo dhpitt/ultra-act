@@ -22,6 +22,7 @@ from utils import load_data # data functions
 from utils import sample_box_pose, sample_insertion_pose # robot functions
 from utils import compute_dict_mean, set_seed, detach_dict # helper functions
 from policy import ACTPolicy, CNNMLPPolicy
+from my_diffusion.model import DiffusionPolicy
 from visualize_episodes import save_videos
 
 from sim_env import BOX_POSE
@@ -119,6 +120,56 @@ def main(args):
     elif policy_class == 'CNNMLP':
         policy_config = {'lr': args['lr'], 'lr_backbone': lr_backbone, 'backbone' : backbone, 'num_queries': 1,
                          'camera_names': camera_names,}
+    elif policy_class == 'Diffusion':
+        down_dims = [args['dim_feedforward'] * (2**k) for k in range(3)]
+        n_obs_steps = 2
+        n_act_steps = 8 # chunk size
+        horizon = 16
+        drop_n_last_timesteps = 7
+        diffusion_step_embed_dim = args['hidden_dim'] # default 128
+        policy_config = {
+            'act_dim': state_dim,  # dimension of pos control space = same dim as pos
+            'qpos_dim': state_dim, # dimension of position space
+            'n_obs_steps': n_obs_steps, # number of input obs steps
+            'n_action_steps': n_act_steps, # number of steps to actually use
+            'horizon': horizon, # number of steps to predict args['chunk_dim']?
+            'drop_n_last_timesteps': drop_n_last_timesteps,
+            'diffusion_step_embed_dim': diffusion_step_embed_dim,
+            'down_dims': down_dims, # downsample
+
+            # vision model params
+            'camera_names': camera_names,
+            'lr_backbone': lr_backbone,
+            'img_shape': None,
+            'n_groups': 8,
+            'use_group_norm': False,
+            'use_film_scale_modulation': True,
+
+            # basic opt
+            'lr': args['lr'],
+            'weight_decay': args['weight_decay'],
+            }
+        
+        '''
+        act_dim,
+        qpos_dim,
+        img_shape,
+        n_cameras,
+        n_obs_steps=2,
+        n_action_steps=8,
+        horizon=16,
+        drop_n_last_frames=7,
+        down_dims=(512,1024,2048),
+        diffusion_step_embed_dim=128,
+        use_separate_backbone_per_camera=True, # for fair comparison
+        lr=1e-5,
+        lr_backbone=5e-5,
+        weight_decay=1e-4,
+        n_groups=8,
+        use_group_norm=False,
+        use_film_scale_modulation=True,
+        '''
+
     else:
         raise NotImplementedError
 
@@ -144,8 +195,9 @@ def main(args):
         # Use basename from args and add info from current run
         wandb_name = args.get('wandb_name', '')
 
-        wandb_name += f'_policy=' + str(policy_class)
+        wandb_name += f'_pol=' + str(policy_class)
         wandb_name += f'_task=' + str(task_name)
+        wandb_name += f'_cs=' + str(args['chunk_size'])
 
         now = datetime.now()
         wandb_name += f"_{now.month}-{now.day}-{now.hour}-{now.minute}-{now.second}"
@@ -168,7 +220,7 @@ def main(args):
         for ckpt_name in ckpt_names:
             success_rate, avg_return = eval_bc(config, load_dir, ckpt_name, 
                                                use_distributed=use_distributed, device=device, is_logger=is_logger,
-                                               save_episode=True)
+                                               save_episode=args['save_videos'])
             if wandb_log and is_logger:
                 wandb.log({f'{ckpt_name}_eval_results': { 
                     'eval_success_rate': success_rate,
@@ -183,8 +235,11 @@ def main(args):
         print()
         exit()
 
-    train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val)
-
+    # drop 7 last frames from each episode for diffusion policy, otherwise don't drop any frames
+    train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val,
+                                                           drop_last_frames=policy_config.get('drop_n_last_frames', None))
+    if config['policy_class'] == "Diffusion":
+        config['policy_config']['stats'] = stats
     # Use distributed sampling to avoid reusing examples in DDP mode
     if use_distributed and dist.is_initialized():
         train_db = train_dataloader.dataset
@@ -230,6 +285,8 @@ def make_policy(policy_class, policy_config):
         policy = ACTPolicy(policy_config)
     elif policy_class == 'CNNMLP':
         policy = CNNMLPPolicy(policy_config)
+    elif policy_class == "Diffusion":
+        policy = DiffusionPolicy(**policy_config)
     else:
         raise NotImplementedError
     return policy
@@ -577,6 +634,7 @@ if __name__ == '__main__':
     parser.add_argument('--load_dir', action='store', type=str, help='dir to load checkpoint', required=False, default=None)
     parser.add_argument('--ckpt_name', action='store', type=str, help='name of checkpoint', required=False, default=None)
     parser.add_argument('--use_distributed', action='store', type=bool, help='whether to use ddp mode', required=False, default=False)
+    parser.add_argument('--save_videos', action='store', type=bool, help='whether to save videos in eval', required=False, default=False)
 
     # for ACT
     parser.add_argument('--kl_weight', action='store', type=int, help='KL Weight', required=False)
