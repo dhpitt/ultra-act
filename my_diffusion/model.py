@@ -11,8 +11,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F  # noqa: N812
 import torchvision
-from diffusers.schedulers.scheduling_ddim import DDIMScheduler
 from diffusers.schedulers.scheduling_ddpm import DDPMScheduler
+
 from torch import Tensor, nn
 import torchvision.transforms as transforms
 
@@ -40,8 +40,8 @@ class DiffusionPolicy(nn.Module):
         diffusion_step_embed_dim=128,
         use_separate_backbone_per_camera=True, # for fair comparison
         lr=1e-5,
-        lr_backbone=5e-5,
-        weight_decay=1e-4,
+        lr_backbone=1e-6,
+        weight_decay=1e-6,
         n_groups=8,
         use_group_norm=False,
         use_film_scale_modulation=True,
@@ -92,20 +92,29 @@ class DiffusionPolicy(nn.Module):
                                         camera_names=camera_names,
                                         use_separate_backbone_per_camera=True)
         
+        for n, p in self.diffusion.named_parameters():
+            if "backbone" in n:
+                p.requires_grad = False
+                
         param_dicts = [
                 {"params": [p for n, p in self.diffusion.named_parameters() if "backbone" not in n and p.requires_grad]},
                 {
                     "params": [p for n, p in self.diffusion.named_parameters() if "backbone" in n and p.requires_grad],
-                    "lr": lr_backbone,
+                    "lr": 0.,
                 },
             ]
         self.optimizer = torch.optim.AdamW(param_dicts, lr=lr,
                                     weight_decay=weight_decay)
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer=self.optimizer,
+            T_max=3000,
+
+        )
 
         self.reset()
 
     def configure_optimizers(self):
-        return self.optimizer
+        return self.optimizer, self.scheduler
 
     def reset(self):
         """Clear observation and action queues. Should be called on `env.reset()`"""
@@ -167,9 +176,15 @@ class DiffusionPolicy(nn.Module):
 
     def forward(self, qpos, images, actions=None, is_pad=None) -> tuple[Tensor, None]:
         """Run the batch through the model and compute the loss for training or validation."""
+
         ## Training/val
         if actions is not None:
+            batch_size, horizon, act_dim = actions.shape
             actions = actions[:, :self.horizon]
+            if horizon < self.horizon:
+                new_actions = torch.zeros(batch_size, self.horizon, act_dim)
+                new_actions[:,:horizon] = actions
+                new_actions[:, horizon:] = actions[:, -1] # clone the last frame up to self.drop_n_last timesteps
             loss = self.diffusion.compute_loss(qpos, images, actions, is_pad)
             loss_dict = {'mse': loss, 'loss': loss}
             # no output_dict so returning None
@@ -195,7 +210,7 @@ class DiffusionModel(nn.Module):
                 drop_n_last_frames=7,
                 do_mask_loss_for_padding=False,
                 vision_backbone='resnet18',
-                pretrained_backbone_weights=None,
+                pretrained_backbone_weights="ResNet18_Weights.IMAGENET1K_V1",
                 spatial_softmax_keypoints=32,
                 use_group_norm=False,
                 crop_shape=None,
@@ -367,7 +382,7 @@ class DiffusionModel(nn.Module):
         start = n_obs_steps - 1
         end = start + self.n_action_steps
         actions = actions[:, start:end]
-
+        #print(f"{actions.shape=}")
         return actions
 
     def compute_loss(self, qpos, images, action, is_pad) -> Tensor:

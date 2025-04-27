@@ -44,7 +44,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
                 if self.n_obs_steps is None:
                     start_ts = np.random.choice(episode_len)
                 else:
-                    start_ts = 1 + np.random.choice(episode_len - self.horizon - 1) # start at 1
+                    start_ts = 1 + np.random.choice(episode_len - self.drop_last_frames - 1) # start at 1
             # get observation at start_ts only
             if self.n_obs_steps is None:
                 qpos = root['/observations/qpos'][start_ts]
