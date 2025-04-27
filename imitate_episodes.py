@@ -100,7 +100,7 @@ def main(args):
 
     # fixed parameters
     state_dim = task_config.get('state_dim', 14)
-    lr_backbone = 1e-5
+    lr_backbone = 1e-6 # from diffusion paper
     backbone = 'resnet18'
     if policy_class == 'ACT':
         enc_layers = 4
@@ -145,7 +145,7 @@ def main(args):
             'clip_sample_range': clip_sample_range, # actions roughly between + - 3
             # vision model params
             'camera_names': camera_names,
-            'lr_backbone': lr_backbone,
+            'lr_backbone': args['lr'] / 10,
             'img_shape': (3, 480,640),
             'n_groups': 8,
             'use_group_norm': False,
@@ -153,7 +153,7 @@ def main(args):
 
             # basic opt
             'lr': args['lr'],
-            'weight_decay': 1e-4,
+            'weight_decay': args['weight_decay'],
             }
         
         '''
@@ -317,10 +317,10 @@ def make_optimizer(policy_class, policy):
     elif policy_class == 'CNNMLP':
         optimizer = policy.configure_optimizers()
     elif policy_class == 'Diffusion':
-        optimizer = policy.configure_optimizers()
+        optimizer, scheduler = policy.configure_optimizers()
     else:
         raise NotImplementedError
-    return optimizer
+    return optimizer, scheduler
 
 
 def get_image(ts, camera_names):
@@ -388,7 +388,7 @@ def eval_bc(config, ckpt_dir, ckpt_name,
             query_frequency = 1
             num_queries = policy_config['num_queries']
     elif policy_class == 'Diffusion':
-        query_frequency = policy_config['n_obs_steps']
+        query_frequency = policy_config['n_action_steps'] - 1
     else:
         raise NotImplementedError()
 
@@ -424,9 +424,7 @@ def eval_bc(config, ckpt_dir, ckpt_name,
         qpos_list = []
         target_qpos_list = []
         rewards = []
-
-        multi_obs_qpos = deque(maxlen=query_frequency)
-        multi_obs_images = deque(maxlen=query_frequency)
+        
         with torch.inference_mode():
             for t in range(max_timesteps):
                 
@@ -445,22 +443,12 @@ def eval_bc(config, ckpt_dir, ckpt_name,
                 qpos_numpy = np.array(obs['qpos'])
                 qpos = pre_process(qpos_numpy)
                 
-                # stack n_obs_steps of qpos
-                multi_obs_qpos.append(qpos)
-                # initialize the queue of observations with repeats of qpos 0
-                while len(multi_obs_qpos) < query_frequency:
-                    multi_obs_qpos.append(qpos)
 
                 qpos = torch.from_numpy(qpos).float().to(device).unsqueeze(0)
                 qpos_history[:, t] = qpos
 
                 # stack n_obs_steps of img
                 curr_image = get_image(ts, camera_names)
-                multi_obs_images.append(curr_image)
-
-                # initialize the queue of observations with repeats of images 0
-                while len(multi_obs_images) < query_frequency:
-                    multi_obs_images.append(curr_image)
 
                 ### query policy
                 if config['policy_class'] == "ACT":
@@ -482,18 +470,6 @@ def eval_bc(config, ckpt_dir, ckpt_name,
                     raw_action = policy(qpos, curr_image)
                 elif config['policy_class'] == "Diffusion":
                     if t % query_frequency == 0:
-                        '''qpos_stack = np.stack(list(multi_obs_qpos)) # n, obs_dim
-
-                        # n_obs, n_cameras, c, h, w --> n_cams, n_obs, c, h, w
-                        images_stack = torch.cat(list(multi_obs_images),dim=0)
-                        images_stack = images_stack.permute(1,0,*list(range(2, images_stack.ndim))) 
-                        print(f"{images_stack.shape=}")
-f
-                        qpos = torch.from_numpy(qpos_stack).float().to(device).unsqueeze(0) # add batch dim
-                        images = images_stack.float().to(device).unsqueeze(0) # add batch dim
-
-                        print(f"in {qpos.shape=}")
-                        print(f"in {images.shape=}")'''
                         all_actions = policy(qpos, curr_image) 
                     raw_action = all_actions[:, t % query_frequency]
                 else:
@@ -573,7 +549,7 @@ def train_bc(train_dataloader, val_dataloader, config, save_dir, device, is_logg
     if use_distributed and dist.is_initialized():
         policy.model = DDP(policy.model, device_ids=[dist.get_rank()], output_device=dist.get_rank())
 
-    optimizer = make_optimizer(policy_class, policy)
+    optimizer, scheduler = make_optimizer(policy_class, policy)
 
     train_history = []
     validation_history = []
@@ -619,6 +595,10 @@ def train_bc(train_dataloader, val_dataloader, config, save_dir, device, is_logg
             loss.backward()
             optimizer.step()
             optimizer.zero_grad()
+
+            if scheduler is not None:
+                scheduler.step(epoch)
+
             train_history.append(detach_dict(forward_dict))
         epoch_summary = compute_dict_mean(train_history[(batch_idx+1)*epoch:(batch_idx+1)*(epoch+1)])
         epoch_train_loss = epoch_summary['loss']
@@ -701,6 +681,7 @@ if __name__ == '__main__':
     parser.add_argument('--use_distributed', action='store', type=bool, help='whether to use ddp mode', required=False, default=False)
     parser.add_argument('--save_videos', action='store', type=bool, help='whether to save videos in eval', required=False, default=False)
     parser.add_argument('--clip_sample_range', action='store', type=float, help='magnitude at which to clip noise', required=False, default=None)
+    parser.add_argument('--weight_decay', action='store', type=float, help='magnitude at which to clip noise', required=False, default=0.0001)
     parser.add_argument('--eval_after', action='store_true', help='whether to eval after training', required=False, default=False)
 
     # for ACT
