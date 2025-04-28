@@ -105,16 +105,14 @@ class DiffusionPolicy(nn.Module):
             ]
         self.optimizer = torch.optim.AdamW(param_dicts, lr=lr,
                                     weight_decay=weight_decay)
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer=self.optimizer,
-            T_max=3000,
-
-        )
 
         self.reset()
 
     def configure_optimizers(self):
-        return self.optimizer, self.scheduler
+        n_params = sum([x.numel() for x in  self.diffusion.parameters()])
+        print(f"{n_params} diffusion parameters")
+        
+        return self.optimizer
 
     def reset(self):
         """Clear observation and action queues. Should be called on `env.reset()`"""
@@ -144,20 +142,7 @@ class DiffusionPolicy(nn.Module):
         "horizon" may not the best name to describe what the variable actually means, because this period is
         actually measured from the first observation which (if `n_obs_steps` > 1) happened in the past.
         """
-        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                         std=[0.229, 0.224, 0.225])
-        images = normalize(images)
-
-        # print(f"{qpos=}")
-        # print(f"{qpos.shape=}")
-
         
-        '''if self.image_features:
-            batch = dict(batch)  # shallow copy so that adding a key doesn't modify the original
-            batch["observation.images"] = torch.stack(
-                [batch[key] for key in self.image_features], dim=-4
-            )'''
-        # Note: It's important that this happens after stacking the images into a single key.
         if actions is not None:
             self._action_queue = populate_single_queue(self._action_queue, actions)
         self._qpos_queue = populate_single_queue(self._qpos_queue, qpos)
@@ -297,7 +282,6 @@ class DiffusionModel(nn.Module):
     ) -> Tensor:
         device = get_device_from_parameters(self)
         dtype = get_dtype_from_parameters(self)
-
         # Sample prior.
         sample = torch.randn(
             size=(batch_size, self.horizon, self.act_dim),
@@ -317,14 +301,23 @@ class DiffusionModel(nn.Module):
             )
             # Compute previous image: x_t -> x_t-1
             sample = self.noise_scheduler.step(model_output, t, sample, generator=generator).prev_sample
-
         return sample
 
     def _prepare_global_conditioning(self, qpos, images) -> Tensor:
         """Encode image features and concatenate them all together along with the state vector."""
         batch_size, n_obs_steps = qpos.shape[:2]
         global_cond_feats = [qpos]
-        #print(f"{images.shape=}")
+        # Normalize and reshape images
+        batch_size, n_cams, n_obs, _, _, _ = images.shape
+        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                         std=[0.229, 0.224, 0.225])
+        if images.shape[-2:] != self.img_shape:
+            resize = transforms.Resize((self.img_shape)) # "lift" task in paper uses this setting
+            images = einops.rearrange(images, 'b n s ... -> ( b n s) ...')
+            images = resize(images)
+            images = einops.rearrange(images, '(b n s) ... -> b n s ...', b=batch_size, n=n_cams, s=n_obs)
+
+        images = normalize(images)
         # Extract image features.
         if self.use_separate_backbone_per_camera:
             # images come in b, n_cameras, n_obs, c, h, w == one image per action
@@ -368,7 +361,6 @@ class DiffusionModel(nn.Module):
             "observation.environment_state": (B, environment_dim)
         }
         """
-        # print(f"in generate, {qpos.shape=}")
         batch_size, n_obs_steps, _ = qpos.shape
         assert n_obs_steps == self.n_obs_steps
 
@@ -377,12 +369,10 @@ class DiffusionModel(nn.Module):
 
         # run sampling
         actions = self.conditional_sample(batch_size, global_cond=global_cond)
-
         # Extract `n_action_steps` steps worth of actions (from the current observation).
         start = n_obs_steps - 1
         end = start + self.n_action_steps
         actions = actions[:, start:end]
-        #print(f"{actions.shape=}")
         return actions
 
     def compute_loss(self, qpos, images, action, is_pad) -> Tensor:
@@ -528,7 +518,7 @@ class DiffusionRgbEncoder(nn.Module):
     """
 
     def __init__(self, vision_backbone='resnet18', 
-                 image_shape=(3,480,640),
+                 image_shape=(480,640),
                  spatial_softmax_num_keypoints=32,
                  use_group_norm=False,
                  crop_shape=None, 
@@ -573,8 +563,8 @@ class DiffusionRgbEncoder(nn.Module):
 
         # Note: we have a check in the config class to make sure all images have the same shape.
         
-        dummy_shape_c_h_w = crop_shape if crop_shape is not None else image_shape[-3:] # c, h, w
-        dummy_shape = (1, *dummy_shape_c_h_w)
+        dummy_shape_h_w = crop_shape if crop_shape is not None else image_shape[-2:] # c, h, w
+        dummy_shape = (1, 3, *dummy_shape_h_w)
         feature_map_shape = get_output_shape(self.backbone, dummy_shape)[1:]
 
         self.pool = SpatialSoftmax(feature_map_shape, num_kp=spatial_softmax_num_keypoints)

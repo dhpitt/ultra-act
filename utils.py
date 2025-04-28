@@ -8,7 +8,14 @@ import IPython
 e = IPython.embed
 
 class EpisodicDataset(torch.utils.data.Dataset):
-    def __init__(self, episode_ids, dataset_dir, camera_names, norm_stats, drop_last_frames=None, n_obs_steps=None, horizon=None):
+    def __init__(self, episode_ids, 
+                 dataset_dir, 
+                 camera_names, 
+                 norm_stats, 
+                 drop_last_frames=None, 
+                 n_obs_steps=None, 
+                 horizon=None,
+                 importance_sampling=False):
         super(EpisodicDataset).__init__()
         self.episode_ids = episode_ids
         self.dataset_dir = dataset_dir
@@ -18,6 +25,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
         self.drop_last_frames = drop_last_frames
         self.n_obs_steps = n_obs_steps
         self.horizon = horizon
+        self.importance_sampling = importance_sampling
 
         if self.horizon is not None:
             assert self.n_obs_steps is not None
@@ -44,7 +52,20 @@ class EpisodicDataset(torch.utils.data.Dataset):
                 if self.n_obs_steps is None:
                     start_ts = np.random.choice(episode_len)
                 else:
-                    start_ts = 1 + np.random.choice(episode_len - self.drop_last_frames - 1) # start at 1
+                    # sample from 1 to end - drop_last_frames
+                    sample_range = episode_len - self.drop_last_frames - 1
+                    if self.importance_sampling:
+                        probs = np.arange(sample_range)
+                        linear_elbow = sample_range // 2
+                        # linearly increase probability until halfway through dataset
+                        probs[linear_elbow:] = probs[linear_elbow]
+                        probs += probs[linear_elbow] # bump up all values
+                        p = probs / probs.sum()
+
+                        start_ts = 1 + np.random.choice(sample_range, p=p)
+                    else:
+                        # uniformly sample from start to end
+                        start_ts = 1 + np.random.choice(sample_range) # start at 1
             # get observation at start_ts only
             if self.n_obs_steps is None:
                 qpos = root['/observations/qpos'][start_ts]
@@ -145,7 +166,14 @@ def get_norm_stats(dataset_dir, num_episodes):
     return stats
 
 
-def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val, drop_last_frames, horizon, n_obs_steps):
+def load_data(dataset_dir, 
+              num_episodes, 
+              camera_names, 
+              batch_size_train, 
+              batch_size_val, 
+              drop_last_frames, 
+              horizon, n_obs_steps, 
+              importance_sampling):
     print(f'\nData from: {dataset_dir}\n')
     # obtain train test split
     train_ratio = 0.8
@@ -158,7 +186,8 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
 
     # construct dataset and dataloader
     train_dataset = EpisodicDataset(train_indices, dataset_dir, camera_names, norm_stats, 
-                                    drop_last_frames=drop_last_frames,n_obs_steps=n_obs_steps, horizon=horizon)
+                                    drop_last_frames=drop_last_frames,n_obs_steps=n_obs_steps, horizon=horizon, 
+                                    importance_sampling=importance_sampling)
     images, obs, action, _ = train_dataset[0]
     '''
     print(f"{images.shape=}")
@@ -171,7 +200,8 @@ def load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_s
         "action": action.shape
     })
     val_dataset = EpisodicDataset(val_indices, dataset_dir, camera_names, norm_stats, 
-                                  drop_last_frames=drop_last_frames,n_obs_steps=n_obs_steps, horizon=horizon)
+                                  drop_last_frames=drop_last_frames,n_obs_steps=n_obs_steps, horizon=horizon,
+                                  importance_sampling=importance_sampling)
     train_dataloader = DataLoader(train_dataset, batch_size=batch_size_train, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)
     val_dataloader = DataLoader(val_dataset, batch_size=batch_size_val, shuffle=True, pin_memory=True, num_workers=1, prefetch_factor=1)
 

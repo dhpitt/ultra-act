@@ -125,7 +125,7 @@ def main(args):
     elif policy_class == 'Diffusion':
         down_dims = [args['dim_feedforward'] * (2**k) for k in range(3)]
         n_obs_steps = 2
-        n_act_steps = args['chunk_size'] // 2 #8 # chunk size
+        n_act_steps = args['replanning_steps'] # default 8
         horizon = args['chunk_size'] #16 
         drop_n_last_timesteps = horizon - n_act_steps - n_obs_steps + 1
         diffusion_step_embed_dim = args['hidden_dim'] # default 128
@@ -139,14 +139,14 @@ def main(args):
             'drop_n_last_frames': drop_n_last_timesteps,
             'diffusion_step_embed_dim': diffusion_step_embed_dim,
             'down_dims': down_dims, # downsample
-            'img_shape': None,
+            'img_shape': (84, 84),
             'num_train_timesteps': 100,
             'num_inference_steps': None,
             'clip_sample_range': clip_sample_range, # actions roughly between + - 3
             # vision model params
             'camera_names': camera_names,
             'lr_backbone': args['lr'] / 10,
-            'img_shape': (3, 480,640),
+            #'img_shape': (3, 480,640),
             'n_groups': 8,
             'use_group_norm': False,
             'use_film_scale_modulation': True,
@@ -154,6 +154,9 @@ def main(args):
             # basic opt
             'lr': args['lr'],
             'weight_decay': args['weight_decay'],
+
+            # dataset param
+            #'importance_sampling': args['importance_sampling']
             }
         
         '''
@@ -185,6 +188,7 @@ def main(args):
         'episode_len': episode_len,
         'state_dim': state_dim,
         'lr': args['lr'],
+        'lr_schedule': args['lr_schedule'],
         'policy_class': policy_class,
         'onscreen_render': onscreen_render,
         'policy_config': policy_config,
@@ -245,9 +249,10 @@ def main(args):
     train_dataloader, val_dataloader, stats, _ = load_data(dataset_dir, num_episodes, camera_names, batch_size_train, batch_size_val,
                                                            drop_last_frames=policy_config.get('drop_n_last_frames', None),
                                                            horizon=policy_config.get('horizon', None),
-                                                           n_obs_steps=policy_config.get('n_obs_steps', None),)
-    if config['policy_class'] == "Diffusion":
-        config['policy_config']['img_shape'] = stats['ds_meta']['observation.image']
+                                                           n_obs_steps=policy_config.get('n_obs_steps', None),
+                                                           importance_sampling=args.get('importance_sampling', False))
+    #if config['policy_class'] == "Diffusion":
+    #    config['policy_config']['img_shape'] = stats['ds_meta']['observation.image']
     # Use distributed sampling to avoid reusing examples in DDP mode
     if use_distributed and dist.is_initialized():
         train_db = train_dataloader.dataset
@@ -311,15 +316,24 @@ def make_policy(policy_class, policy_config):
     return policy
 
 
-def make_optimizer(policy_class, policy):
+def make_optimizer(policy_class, policy, cosine_lr_schedule, num_epochs=None):
     if policy_class == 'ACT':
         optimizer = policy.configure_optimizers()
     elif policy_class == 'CNNMLP':
         optimizer = policy.configure_optimizers()
     elif policy_class == 'Diffusion':
-        optimizer, scheduler = policy.configure_optimizers()
+        optimizer = policy.configure_optimizers()
     else:
         raise NotImplementedError
+    
+    if cosine_lr_schedule:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer=optimizer,
+            T_max=num_epochs,
+            eta_min=5e-7
+        )
+    else:
+        scheduler = None
     return optimizer, scheduler
 
 
@@ -424,7 +438,7 @@ def eval_bc(config, ckpt_dir, ckpt_name,
         qpos_list = []
         target_qpos_list = []
         rewards = []
-        
+
         with torch.inference_mode():
             for t in range(max_timesteps):
                 
@@ -469,9 +483,10 @@ def eval_bc(config, ckpt_dir, ckpt_name,
                 elif config['policy_class'] == "CNNMLP":
                     raw_action = policy(qpos, curr_image)
                 elif config['policy_class'] == "Diffusion":
-                    if t % query_frequency == 0:
-                        all_actions = policy(qpos, curr_image) 
-                    raw_action = all_actions[:, t % query_frequency]
+                    # select_action returns 1 raw step and handles queueing/caching
+                    raw_action = policy(qpos, curr_image) 
+                    #print(f"{all_actions.shape=}")
+                    #raw_action = all_actions[:, t % query_frequency]
                 else:
                     raise NotImplementedError
 
@@ -549,7 +564,8 @@ def train_bc(train_dataloader, val_dataloader, config, save_dir, device, is_logg
     if use_distributed and dist.is_initialized():
         policy.model = DDP(policy.model, device_ids=[dist.get_rank()], output_device=dist.get_rank())
 
-    optimizer, scheduler = make_optimizer(policy_class, policy)
+    optimizer, scheduler = make_optimizer(policy_class, policy, 
+                                          cosine_lr_schedule=config['lr_schedule'], num_epochs=num_epochs)
 
     train_history = []
     validation_history = []
@@ -598,13 +614,14 @@ def train_bc(train_dataloader, val_dataloader, config, save_dir, device, is_logg
 
             if scheduler is not None:
                 scheduler.step(epoch)
+                epoch_summary['lr'] = scheduler.get_last_lr()[0]
 
             train_history.append(detach_dict(forward_dict))
         epoch_summary = compute_dict_mean(train_history[(batch_idx+1)*epoch:(batch_idx+1)*(epoch+1)])
         epoch_train_loss = epoch_summary['loss']
 
         # Log training epoch metrics to wandb
-        if wandb_log:
+        if wandb_log and is_logger:
             wandb.log({f"train_{k}": v for k, v in epoch_summary.items()}, commit=True, step=epoch)
 
         train_summary_string = ''
@@ -615,7 +632,7 @@ def train_bc(train_dataloader, val_dataloader, config, save_dir, device, is_logg
 
         # save checkpoints way less often for memory.
         # normally i'd parametrize this as part of a training loop
-        if epoch % 500 == 0 and save_dir is not None:
+        if epoch % 500 == 0 and save_dir is not None and is_logger:
             ckpt_path = os.path.join(save_dir, f'policy_epoch_{epoch}_seed_{seed}.ckpt')
             torch.save(policy.state_dict(), ckpt_path)
             plot_history(train_history, validation_history, epoch, save_dir, seed)
@@ -627,7 +644,7 @@ def train_bc(train_dataloader, val_dataloader, config, save_dir, device, is_logg
 
     # save best policy, return best info no matter what
     best_epoch, min_val_loss, best_state_dict = best_ckpt_info
-    if save_dir is not None:
+    if save_dir is not None and is_logger:
         ckpt_path = os.path.join(save_dir, f'best_policy_epoch_{best_epoch}_seed_{seed}.ckpt')
         torch.save(best_state_dict, ckpt_path)
     print(f'Training finished:\nSeed {seed}, val loss {min_val_loss:.6f} at epoch {best_epoch}')
@@ -683,6 +700,9 @@ if __name__ == '__main__':
     parser.add_argument('--clip_sample_range', action='store', type=float, help='magnitude at which to clip noise', required=False, default=None)
     parser.add_argument('--weight_decay', action='store', type=float, help='magnitude at which to clip noise', required=False, default=0.0001)
     parser.add_argument('--eval_after', action='store_true', help='whether to eval after training', required=False, default=False)
+    parser.add_argument('--importance_sampling', action='store_true', help='whether to bias dataset towards later frames', required=False, default=False)
+    parser.add_argument('--replanning_steps', action='store', type=int, help='number of actions to take before replanning', required=False, default=8)
+    parser.add_argument('--lr_schedule', action='store_true', help='whether to use cosine annealing lr sched', required=False, default=False)
 
     # for ACT
     parser.add_argument('--kl_weight', action='store', type=int, help='KL Weight', required=False)
