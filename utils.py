@@ -78,21 +78,27 @@ class EpisodicDataset(torch.utils.data.Dataset):
                     image_dict[cam_name] = root[f'/observations/images/{cam_name}'][start_ts]
                 else:
                     image_dict[cam_name] = root[f'/observations/images/{cam_name}'][start_ts:start_ts+self.n_obs_steps]
-            # get all actions after and including start_ts
+            # get all actions after and including last obs timestep
+
+            action_start_ts = start_ts
+            if self.n_obs_steps is not None:
+                action_start_ts += self.n_obs_steps - 1
             if is_sim:
-                action = root['/action'][start_ts:]
-                action_len = episode_len - start_ts
+                action = root['/action'][action_start_ts:]
+                action_len = episode_len - action_start_ts
             else:
-                action = root['/action'][max(0, start_ts - 1):] # hack, to make timesteps more aligned
-                action_len = episode_len - max(0, start_ts - 1) # hack, to make timesteps more aligned
+                action = root['/action'][max(0, action_start_ts - 1):] # hack, to make timesteps more aligned
+                action_len = episode_len - max(0, action_start_ts - 1) # hack, to make timesteps more aligned
             
             '''if self.horizon is not None:
                 action = action[:self.horizon] # hack, to make timesteps more aligned
                 action_len = self.horizon # hack, to make timesteps more aligned'''
 
         self.is_sim = is_sim
+
         padded_action = np.zeros(original_action_shape, dtype=np.float32)
         padded_action[:action_len] = action
+    
         is_pad = np.zeros(episode_len)
         is_pad[action_len:] = 1
 
@@ -107,6 +113,7 @@ class EpisodicDataset(torch.utils.data.Dataset):
         qpos_data = torch.from_numpy(qpos).float()
         action_data = torch.from_numpy(padded_action).float()
         is_pad = torch.from_numpy(is_pad).bool()
+
 
         # channel last
         if self.n_obs_steps is None:
@@ -189,10 +196,7 @@ def load_data(dataset_dir,
                                     drop_last_frames=drop_last_frames,n_obs_steps=n_obs_steps, horizon=horizon, 
                                     importance_sampling=importance_sampling)
     images, obs, action, _ = train_dataset[0]
-    '''
-    print(f"{images.shape=}")
-    print(f"{obs.shape=}")
-    print(f"{action.shape=}")'''
+    
     # store shapes of one batch for constructing diffusionpolicy
     norm_stats["ds_meta"] = dict({
         "observation.image": images.shape,

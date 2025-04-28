@@ -197,7 +197,7 @@ class DiffusionModel(nn.Module):
                 vision_backbone='resnet18',
                 pretrained_backbone_weights="ResNet18_Weights.IMAGENET1K_V1",
                 spatial_softmax_keypoints=32,
-                use_group_norm=False,
+                use_group_norm=True,
                 crop_shape=None,
                 crop_random=False,
                 down_dims=(512,1024,2048),
@@ -219,6 +219,9 @@ class DiffusionModel(nn.Module):
         self.horizon=horizon
         self.drop_n_last_frames = drop_n_last_frames
         self.prediction_type = "epsilon" # hardcoded diffusion
+
+        if pretrained_backbone_weights is not None:
+            use_group_norm = False # force to avoid mismatch
 
         # Build observation encoders (depending on which observations are provided).
         global_cond_dim = qpos_dim

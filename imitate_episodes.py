@@ -90,7 +90,9 @@ def main(args):
         from aloha_scripts.constants import TASK_CONFIGS
         task_config = TASK_CONFIGS[task_name]
     dataset_dir = task_config['dataset_dir']
-    num_episodes = task_config['num_episodes']
+    num_episodes = args.get('dataset_size', 
+                            task_config['num_episodes'])
+    print(f"{num_episodes=}")
     episode_len = task_config['episode_len']
     camera_names = task_config['camera_names']
 
@@ -148,7 +150,7 @@ def main(args):
             'lr_backbone': args['lr'] / 10,
             #'img_shape': (3, 480,640),
             'n_groups': 8,
-            'use_group_norm': False,
+            'use_group_norm': False, # incompatible with pretrained resnet
             'use_film_scale_modulation': True,
 
             # basic opt
@@ -186,6 +188,7 @@ def main(args):
         'num_epochs': num_epochs,
         'ckpt_dir': ckpt_dir,
         'episode_len': episode_len,
+        'dataset_size': num_episodes,
         'state_dim': state_dim,
         'lr': args['lr'],
         'lr_schedule': args['lr_schedule'],
@@ -615,6 +618,8 @@ def train_bc(train_dataloader, val_dataloader, config, save_dir, device, is_logg
             if scheduler is not None:
                 scheduler.step(epoch)
                 epoch_summary['lr'] = scheduler.get_last_lr()[0]
+            else:
+                epoch_summary['lr'] = config['lr']
 
             train_history.append(detach_dict(forward_dict))
         epoch_summary = compute_dict_mean(train_history[(batch_idx+1)*epoch:(batch_idx+1)*(epoch+1)])
@@ -698,10 +703,11 @@ if __name__ == '__main__':
     parser.add_argument('--use_distributed', action='store', type=bool, help='whether to use ddp mode', required=False, default=False)
     parser.add_argument('--save_videos', action='store', type=bool, help='whether to save videos in eval', required=False, default=False)
     parser.add_argument('--clip_sample_range', action='store', type=float, help='magnitude at which to clip noise', required=False, default=None)
-    parser.add_argument('--weight_decay', action='store', type=float, help='magnitude at which to clip noise', required=False, default=0.0001)
+    parser.add_argument('--weight_decay', action='store', type=float, help='magnitude at which to clip noise', required=False, default=0.000001)
     parser.add_argument('--eval_after', action='store_true', help='whether to eval after training', required=False, default=False)
     parser.add_argument('--importance_sampling', action='store_true', help='whether to bias dataset towards later frames', required=False, default=False)
     parser.add_argument('--replanning_steps', action='store', type=int, help='number of actions to take before replanning', required=False, default=8)
+    parser.add_argument('--dataset_size', action='store', type=int, help='number of examples in dataset', required=False, default=50)
     parser.add_argument('--lr_schedule', action='store_true', help='whether to use cosine annealing lr sched', required=False, default=False)
 
     # for ACT
