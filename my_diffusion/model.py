@@ -92,15 +92,15 @@ class DiffusionPolicy(nn.Module):
                                         camera_names=camera_names,
                                         use_separate_backbone_per_camera=True)
         
-        for n, p in self.diffusion.named_parameters():
+        '''for n, p in self.diffusion.named_parameters():
             if "backbone" in n:
-                p.requires_grad = False
+                p.requires_grad = False'''
                 
         param_dicts = [
                 {"params": [p for n, p in self.diffusion.named_parameters() if "backbone" not in n and p.requires_grad]},
                 {
                     "params": [p for n, p in self.diffusion.named_parameters() if "backbone" in n and p.requires_grad],
-                    "lr": 0.,
+                    "lr": lr_backbone,
                 },
             ]
         self.optimizer = torch.optim.AdamW(param_dicts, lr=lr,
