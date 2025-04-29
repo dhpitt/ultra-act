@@ -81,6 +81,10 @@ def get_args_parser():
     parser.add_argument('--save_videos', action='store', type=bool, help='whether to save videos in eval', required=False, default=False)
     parser.add_argument('--eval_after', action='store_true', help='whether to eval after training', required=False, default=False)
     parser.add_argument('--clip_sample_range', action='store', type=float, help='magnitude at which to clip noise', required=False, default=None)
+    parser.add_argument('--importance_sampling', action='store_true', help='whether to bias dataset towards later frames', required=False, default=False)
+    parser.add_argument('--replanning_steps', action='store', type=int, help='number of actions to take before replanning', required=False, default=8)
+    parser.add_argument('--lr_schedule', action='store_true', help='whether to use cosine annealing lr sched', required=False, default=False)
+    parser.add_argument('--dataset_size', action='store', type=int, help='number of examples in dataset', required=False, default=50)
 
     return parser
 
