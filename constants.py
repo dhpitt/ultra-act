@@ -26,10 +26,10 @@ SIM_TASK_CONFIGS = {
     },
 
     'sim_insertion_scripted': {
-        'dataset_dir': DATA_DIR + '/sim_insertion_scripted_multicam',
-        'num_episodes': 50,
+        'dataset_dir': DATA_DIR + '/sim_insertion_scripted',
+        'num_episodes': 150,
         'episode_len': 400,
-        'camera_names': ['top', 'angle', 'vis'],
+        'camera_names': ['top', 'angle'],
 
     },
 
