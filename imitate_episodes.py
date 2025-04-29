@@ -110,6 +110,7 @@ def main(args):
         nheads = 8
         policy_config = {'lr': args['lr'],
                          'num_queries': args['chunk_size'],
+                         'replanning_steps': args['replanning_steps'],
                          'kl_weight': args['kl_weight'],
                          'hidden_dim': args['hidden_dim'],
                          'dim_feedforward': args['dim_feedforward'],
@@ -400,7 +401,7 @@ def eval_bc(config, ckpt_dir, ckpt_name,
         env_max_reward = env.task.max_reward
 
     if policy_class in ['ACT', 'CNNMLP']:
-        query_frequency = policy_config['num_queries']
+        query_frequency = policy_config['replanning_steps']
         if temporal_agg:
             query_frequency = 1
             num_queries = policy_config['num_queries']
@@ -617,14 +618,15 @@ def train_bc(train_dataloader, val_dataloader, config, save_dir, device, is_logg
 
             if scheduler is not None:
                 scheduler.step(epoch)
-                epoch_summary['lr'] = scheduler.get_last_lr()[0]
-            else:
-                epoch_summary['lr'] = config['lr']
 
             train_history.append(detach_dict(forward_dict))
         epoch_summary = compute_dict_mean(train_history[(batch_idx+1)*epoch:(batch_idx+1)*(epoch+1)])
         epoch_train_loss = epoch_summary['loss']
-
+        if scheduler is not None:
+            epoch_lr = scheduler.get_last_lr()[0]
+        else:
+            epoch_lr = config['lr']
+        wandb.log({'lr': epoch_lr}, step=epoch, commit=False)
         # Log training epoch metrics to wandb
         if wandb_log and is_logger:
             wandb.log({f"train_{k}": v for k, v in epoch_summary.items()}, commit=True, step=epoch)
